@@ -3,8 +3,6 @@
 This is the most important test file in the repo. If you add a table with a library_id,
 add a case here.
 """
-import importlib
-import os
 import uuid
 
 import pytest
@@ -24,21 +22,20 @@ VEC = "[" + ",".join(["0.1"] * 512) + "]"
 
 
 @pytest.fixture(scope="module")
-def env(make_db_module):
-    db = make_db_module
-    db.upgrade("head")
-    eng = db.engine()
+def env(app_db):
+    eng = app_db.engine()
     with eng.begin() as c:
         for u, h in [(A_OWNER, "a-owner"), (A_EDITOR, "a-editor"), (A_VIEWER, "a-viewer"),
                      (B_OWNER, "b-owner"), (OUTSIDER, "outsider")]:
+            c.execute(text("INSERT INTO auth.users (id, email) VALUES (:i, :e)"), {"i": u, "e": f"{h}@test.dev"})
             c.execute(text("INSERT INTO profile (id, display_name, handle) VALUES (:i, :h, :h)"), {"i": u, "h": h})
         c.execute(text("INSERT INTO library (id, name, created_by) VALUES (:a,'L1',:ao),(:b,'L2',:bo)"),
                   {"a": L1, "b": L2, "ao": A_OWNER, "bo": B_OWNER})
         c.execute(text("""INSERT INTO library_member VALUES
             (:l1,:ao,'owner'),(:l1,:ae,'editor'),(:l1,:av,'viewer'),(:l2,:bo,'owner')"""),
                   {"l1": L1, "l2": L2, "ao": A_OWNER, "ae": A_EDITOR, "av": A_VIEWER, "bo": B_OWNER})
-        c.execute(text("""INSERT INTO photo (id, library_id, uploader_id, user_id, storage_path, thumbnail_path, status)
-            VALUES (:p1,:l1,:ao,:ao,'s','t','ready'),(:p2,:l2,:bo,:bo,'s','t','ready')"""),
+        c.execute(text("""INSERT INTO photo (id, library_id, uploader_id, storage_path, thumbnail_path, status)
+            VALUES (:p1,:l1,:ao,'s','t','ready'),(:p2,:l2,:bo,'s','t','ready')"""),
                   {"p1": P1, "p2": P2, "l1": L1, "l2": L2, "ao": A_OWNER, "bo": B_OWNER})
         c.execute(text("""INSERT INTO album (id, name, created_at, created_by, library_id)
             VALUES (:a1,'a1',now(),:ao,:l1),(:a2,'a2',now(),:bo,:l2)"""),
@@ -49,19 +46,12 @@ def env(make_db_module):
             VALUES (:f1,:p1,:l1,'{VEC}'),(:f2,:p2,:l2,'{VEC}')"""),
                   {"f1": FACE1, "f2": FACE2, "p1": P1, "p2": P2, "l1": L1, "l2": L2})
         # Sensitive, service-role-only rows
-        consent = uuid.uuid4()
-        c.execute(text("INSERT INTO biometric_consent (id, profile_id, notice_version, granted_at) "
-                       "VALUES (:c,:u,'v1',now())"), {"c": consent, "u": A_OWNER})
-        c.execute(text("INSERT INTO face_credential (profile_id, embedding_enc, model_version, consent_id) "
-                       "VALUES (:u, '\\x00', 'm', :c)"), {"u": A_OWNER, "c": consent})
+        c.execute(text("INSERT INTO biometric_consent (profile_id, notice_version, granted_at) "
+                       "VALUES (:u,'v1',now())"), {"u": A_OWNER})
         c.execute(text("INSERT INTO audit_log (action) VALUES ('seed')"))
     eng.dispose()
 
-    os.environ["DATABASE_URL"] = db.url
-    import app.db.session as session_mod
-    importlib.reload(session_mod)
     import app.db.rls as rls_mod
-    importlib.reload(rls_mod)
     return rls_mod
 
 
@@ -108,8 +98,8 @@ def test_profiles_visible_only_when_sharing_a_library_or_self(env):
 # ---------------------------------------------------------------------------- writes
 
 def _photo_insert(lib, uploader, pid=None):
-    return ("INSERT INTO photo (id, library_id, uploader_id, user_id, storage_path, thumbnail_path) "
-            "VALUES (:id, :lib, :up, :up, 's', 't')",
+    return ("INSERT INTO photo (id, library_id, uploader_id, storage_path, thumbnail_path) "
+            "VALUES (:id, :lib, :up, 's', 't')",
             {"id": pid or uuid.uuid4(), "lib": lib, "up": uploader})
 
 
@@ -210,7 +200,7 @@ def test_cannot_link_foreign_photo_into_album(env):
 
 # ----------------------------------------------------- sensitive tables stay sealed
 
-@pytest.mark.parametrize("table", ["face_credential", "biometric_consent", "audit_log", "albummemberlink"])
+@pytest.mark.parametrize("table", ["biometric_consent", "audit_log"])
 def test_authenticated_cannot_touch_service_only_tables(env, table):
     with pytest.raises(DBAPIError, match="permission denied"):
         q(env, A_OWNER, f"SELECT * FROM {table}")
@@ -241,3 +231,52 @@ def test_every_orm_table_is_queryable(env):
     with env.service_session() as s:
         for table in SQLModel.metadata.sorted_tables:
             s.execute(select(table).limit(0))
+
+
+# ----------------------------------------------------- identity must survive a commit
+
+def test_identity_and_role_survive_a_mid_request_commit(env):
+    """SET LOCAL ends with the transaction; the after_begin hook must re-apply it, or code after a
+    commit() would silently run as the table owner and see every library."""
+    with env.rls_session(A_OWNER) as s:
+        s.execute(text("SELECT 1"))
+        s.commit()
+        assert s.execute(text("SELECT current_user")).scalar() == "authenticated"
+        seen = ids(s.execute(text("SELECT id FROM photo")).all())
+        assert P1 in seen and P2 not in seen
+        s.commit()
+        assert s.execute(text("SELECT auth.uid()")).scalar() == A_OWNER
+        s.rollback()
+        assert s.execute(text("SELECT auth.uid()")).scalar() == A_OWNER
+
+
+# ----------------------------------------------------------------- invites and owners
+
+def test_invites_visible_only_to_owners_and_token_hash_is_never_selectable(env):
+    with env.service_session() as s:
+        s.execute(text("INSERT INTO library_invite (library_id, email, role, token_hash, created_by, expires_at) "
+                       "VALUES (:l,'x@test.dev','viewer','h1',:u, now() + interval '1 day')"), {"l": L1, "u": A_OWNER})
+    assert len(q(env, A_OWNER, "SELECT id FROM library_invite")) >= 1
+    assert q(env, A_EDITOR, "SELECT id FROM library_invite") == []
+    assert q(env, B_OWNER, "SELECT id FROM library_invite") == []
+    with pytest.raises(DBAPIError, match="permission denied"):
+        q(env, A_OWNER, "SELECT token_hash FROM library_invite")
+
+
+def test_non_owner_cannot_create_invites(env):
+    with pytest.raises(DBAPIError, match="row-level security"):
+        q(env, A_EDITOR, "INSERT INTO library_invite (library_id, email, role, token_hash, created_by, expires_at) "
+          "VALUES (:l,'e@test.dev','viewer','h2',:u, now() + interval '1 day')", l=L1, u=A_EDITOR)
+
+
+def test_last_owner_cannot_be_removed_or_demoted_but_library_can_be_deleted(env):
+    with pytest.raises(DBAPIError, match="last_owner"):
+        q(env, B_OWNER, "DELETE FROM library_member WHERE library_id=:l AND profile_id=:u", l=L2, u=B_OWNER)
+    with pytest.raises(DBAPIError, match="last_owner"):
+        q(env, B_OWNER, "UPDATE library_member SET role='editor' WHERE library_id=:l AND profile_id=:u",
+          l=L2, u=B_OWNER)
+    # Deleting the whole library cascades to its members and must not trip the guard.
+    with env.rls_session(OUTSIDER) as s:
+        lib = s.execute(text("SELECT create_library('Temp')")).scalar()
+        s.commit()
+        assert s.execute(text("DELETE FROM library WHERE id=:l"), {"l": lib}).rowcount == 1

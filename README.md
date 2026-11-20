@@ -47,6 +47,31 @@ pytest -q        # DB tests are skipped when TEST_DATABASE_URL is unset
 CI runs the same commands on every push. Tests create and drop their own throwaway databases and
 refuse to run against a non-local host.
 
+## Sign-in setup (Supabase Auth)
+
+Sign-in is by emailed magic link. The API verifies Supabase tokens using your project's public
+signing keys, so no secret is needed. In `.env`:
+
+```
+SUPABASE_URL=https://<your-ref>.supabase.co
+SUPABASE_ANON_KEY=<publishable / anon key>   # public by design; never the service_role key
+APP_BASE_URL=http://localhost:8000
+```
+
+In the Supabase dashboard: Authentication > Providers > Email enabled; Authentication > URL
+Configuration > Site URL `http://localhost:8000` and redirect `http://localhost:8000/**`.
+
+Then run the API, open <http://localhost:8000/login>, and request a link. After the first sign-in,
+link your pre-existing profile (library, photos) to your account:
+
+```bash
+python scripts/link_owner.py --email you@example.com           # dry run
+python scripts/link_owner.py --email you@example.com --apply
+```
+
+To invite someone, an owner calls `POST /api/libraries/{id}/invites` (try it in `/docs` after
+clicking Authorize with the token from `/login`) and sends them the returned link.
+
 ## Run the (prototype) API
 
 ```bash
@@ -58,6 +83,6 @@ uvicorn app.main:app --reload
 - `app/`: FastAPI app (api, db, models, services)
 - `migrations/`: Alembic migrations (schema, RLS policies)
 - `docker/`, `docker-compose.yml`: local Postgres
-- `scripts/`: one-off utilities (bulk upload, storage sync)
+- `scripts/`: one-off utilities (`link_owner.py`; `bulk_upload.py` and `synch_storage.py` are stale prototypes)
 - `tests/`: pytest suite
 - `docs/`: architecture and migration plan

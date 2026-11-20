@@ -17,6 +17,9 @@ end $$;
 
 create schema if not exists auth;
 
+-- Supabase's user table (we only need id and email for FKs and tests).
+create table if not exists auth.users (id uuid primary key, email text);
+
 -- Same contract as Supabase: reads the JWT subject from the request settings.
 create or replace function auth.uid() returns uuid
 language sql stable as $$

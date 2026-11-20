@@ -1,0 +1,157 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sign in</title>
+<style>
+  :root { color-scheme: light dark; --fg:#1d1d1f; --bg:#fafafa; --card:#fff; --muted:#6b6b70; --line:#d9d9de; --accent:#2f5bea; }
+  @media (prefers-color-scheme: dark) { :root { --fg:#f2f2f4; --bg:#161618; --card:#1f1f23; --muted:#a0a0a8; --line:#34343a; --accent:#7b9bff; } }
+  body { margin:0; font:16px/1.5 system-ui, sans-serif; background:var(--bg); color:var(--fg); }
+  main { max-width:30rem; margin:0 auto; padding:2rem 1rem; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:1.25rem; margin-top:1rem; }
+  h1 { font-size:1.4rem; margin:0 0 .25rem; } p { margin:.5rem 0; } .muted { color:var(--muted); font-size:.9rem; }
+  label { display:block; font-weight:600; margin-bottom:.35rem; }
+  input { width:100%; box-sizing:border-box; padding:.6rem .7rem; font:inherit; border:1px solid var(--line); border-radius:8px; background:transparent; color:inherit; }
+  button { font:inherit; padding:.55rem .9rem; border-radius:8px; border:1px solid var(--accent); background:var(--accent); color:#fff; cursor:pointer; margin:.5rem .5rem 0 0; }
+  button.secondary { background:transparent; color:var(--accent); }
+  [hidden] { display:none !important; } .error { color:#c62828; } .ok { color:#2e7d32; }
+  ul { padding-left:1.1rem; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Family Photo Album</h1>
+  <p class="muted">Developer sign-in page. A full app comes later.</p>
+
+  <div class="card" id="signedout" hidden>
+    <form id="form">
+      <label for="email">Email</label>
+      <input id="email" type="email" autocomplete="email" required placeholder="you@example.com">
+      <button type="submit">Email me a sign-in link</button>
+    </form>
+    <p id="invite-note" class="muted" hidden>You were invited to a library. Sign in with the email address the invite was sent to.</p>
+  </div>
+
+  <div class="card" id="signedin" hidden>
+    <p>Signed in as <strong id="who"></strong></p>
+    <div id="invite" hidden>
+      <p>You have an invite waiting.</p>
+      <button id="accept">Accept invite</button>
+    </div>
+    <p class="muted">Your libraries</p>
+    <ul id="libs"></ul>
+    <button id="copy" class="secondary">Copy access token</button>
+    <button id="refresh" class="secondary">Refresh token</button>
+    <button id="out" class="secondary">Sign out</button>
+    <p class="muted">To try the API, open <a href="/docs">/docs</a>, click Authorize, and paste the token.</p>
+  </div>
+
+  <p id="msg" role="status"></p>
+</main>
+
+<script>
+(function () {
+  "use strict";
+  var SESSION = "album-session", INVITE = "album-invite-token";
+  var cfg = null;
+  var $ = function (id) { return document.getElementById(id); };
+
+  function say(text, kind) { var m = $("msg"); m.textContent = text || ""; m.className = kind || ""; }
+  function load() { try { return JSON.parse(localStorage.getItem(SESSION)); } catch (e) { return null; } }
+  function save(s) { localStorage.setItem(SESSION, JSON.stringify(s)); }
+
+  function adoptSession(p) {
+    save({ access_token: p.access_token, refresh_token: p.refresh_token,
+           expires_at: Math.floor(Date.now() / 1000) + (parseInt(p.expires_in, 10) || 3600) });
+  }
+
+  function readUrl() {
+    // Magic-link return: tokens arrive in the URL hash. Read them, then scrub them from the address bar.
+    var hash = new URLSearchParams(location.hash.replace(/^#/, ""));
+    if (hash.get("access_token")) { adoptSession(Object.fromEntries(hash)); }
+    else if (hash.get("error_description")) { say(hash.get("error_description").replace(/\+/g, " "), "error"); }
+
+    var q = new URLSearchParams(location.search);
+    if (q.get("token")) { sessionStorage.setItem(INVITE, q.get("token")); }
+    history.replaceState(null, "", location.pathname === "/invite" ? "/login" : location.pathname);
+  }
+
+  function api(path, opts) {
+    var s = load();
+    opts = opts || {};
+    opts.headers = Object.assign({ "Authorization": "Bearer " + (s && s.access_token) }, opts.headers || {});
+    return fetch(path, opts);
+  }
+
+  async function refresh() {
+    var s = load();
+    if (!s || !s.refresh_token) return false;
+    var r = await fetch(cfg.supabase_url + "/auth/v1/token?grant_type=refresh_token", {
+      method: "POST", headers: { "apikey": cfg.supabase_anon_key, "Content-Type": "application/json" },
+      body: JSON.stringify({ refresh_token: s.refresh_token })
+    });
+    if (!r.ok) return false;
+    adoptSession(await r.json());
+    return true;
+  }
+
+  async function render() {
+    var s = load();
+    if (s && s.expires_at - 60 < Date.now() / 1000) { if (!(await refresh())) { localStorage.removeItem(SESSION); s = null; } }
+    s = load();
+    $("signedout").hidden = !!s;
+    $("signedin").hidden = !s;
+    $("invite-note").hidden = !sessionStorage.getItem(INVITE);
+    if (!s) return;
+
+    var r = await api("/api/me");
+    if (r.status === 401) { localStorage.removeItem(SESSION); return render(); }
+    var me = await r.json();
+    $("who").textContent = me.display_name + " (" + (me.email || "no email") + ")";
+    var ul = $("libs"); ul.textContent = "";
+    if (!me.libraries.length) { var li = document.createElement("li"); li.textContent = "None yet"; ul.appendChild(li); }
+    me.libraries.forEach(function (l) {
+      var li = document.createElement("li"); li.textContent = l.name + " — " + l.role; ul.appendChild(li);
+    });
+    $("invite").hidden = !sessionStorage.getItem(INVITE);
+  }
+
+  $("form").addEventListener("submit", async function (e) {
+    e.preventDefault();
+    var email = $("email").value.trim();
+    say("Sending…");
+    var r = await fetch(cfg.supabase_url + "/auth/v1/otp?redirect_to=" + encodeURIComponent(location.origin + "/login"), {
+      method: "POST", headers: { "apikey": cfg.supabase_anon_key, "Content-Type": "application/json" },
+      body: JSON.stringify({ email: email, create_user: true })
+    });
+    if (r.ok) say("Check your email and click the link. You can close this tab.", "ok");
+    else say("Could not send the link (" + r.status + "). Wait a minute and try again.", "error");
+  });
+
+  $("accept").addEventListener("click", async function () {
+    var r = await api("/api/invites/accept", { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ token: sessionStorage.getItem(INVITE) }) });
+    var body = await r.json().catch(function () { return {}; });
+    if (r.ok) { sessionStorage.removeItem(INVITE); say("Joined!", "ok"); render(); }
+    else say(body.detail || "Could not accept the invite.", "error");
+  });
+
+  $("copy").addEventListener("click", async function () {
+    await navigator.clipboard.writeText(load().access_token);
+    say("Token copied. It expires in about an hour; use Refresh token for a new one.", "ok");
+  });
+  $("refresh").addEventListener("click", async function () { say((await refresh()) ? "Token refreshed." : "Could not refresh. Sign in again.", "ok"); });
+  $("out").addEventListener("click", function () { localStorage.removeItem(SESSION); sessionStorage.removeItem(INVITE); say("Signed out.", "ok"); render(); });
+
+  (async function () {
+    var r = await fetch("/api/config");
+    if (!r.ok) { say("Server is missing SUPABASE_ANON_KEY (see README).", "error"); return; }
+    cfg = await r.json();
+    readUrl();
+    render();
+  })();
+})();
+</script>
+</body>
+</html>

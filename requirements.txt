@@ -13,6 +13,10 @@ pgvector==0.4.2
 GeoAlchemy2==0.18.1
 alembic==1.16.5
 
+# Auth (Supabase JWT verification)
+PyJWT[crypto]==2.10.1
+cryptography==50.0.2
+
 # Cloud Storage (R2/S3)
 boto3==1.42.44
 

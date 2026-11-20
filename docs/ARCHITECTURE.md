@@ -8,20 +8,20 @@ This document is the single source of truth for moving the prototype in `app/` t
 
 ## 1. Goals, scope, non-goals
 
-**Goal:** a private, family-only photo album where anyone can ask for "Mia, summer 2019" and get the right photos, and where members sign in with a name and a face picture.
+**Goal:** a private, family-only photo album where anyone can ask for "Mia, summer 2019" and get the right photos, with members signing in by email or passkey and faces used only to find people in photos.
 
 **In scope**
 
 - Person-centric data model: named people who do not need accounts (children, grandparents, deceased relatives).
 - One search that combines person(s), time range, and free text.
-- Sign-in with name + face, with a safe fallback (section 5).
+- Sign-in with email magic link or passkey (managed by Supabase Auth). No passwords.
 - Reliable bulk import of large archives (20k+ photos, mostly iPhone HEIC).
 - Tenant isolation enforced by the database (Row Level Security), not by endpoint code.
 
 **Non-goals for v1**
 
 - Public sharing, social features, video, pet recognition.
-- Face recognition as the *only* authentication factor (section 5.1 explains why).
+- Face login. Decided against: faces are used only to find people in photos, never to authenticate (section 5.4).
 - Replacing Python, FastAPI, Postgres, or R2. The stack is fine; the data model, pipeline, and security are what change.
 
 **"Industry standard" means**
@@ -93,8 +93,26 @@ person(id uuid pk, library_id uuid not null references library,
        display_name text not null, birth_date date, death_date date,
        profile_id uuid references profile,            -- nullable
        cover_face_id uuid,                            -- fk added after face exists
+       recognition_opt_out boolean not null default false,  -- never match or suggest this person
        created_by uuid references profile, created_at timestamptz,
        unique (library_id, profile_id))
+
+-- Nicknames: "Grandma", "Nana", "Abuela". The display_name is always searchable too.
+-- Not unique per library: two people may both be "Grandma" (search then asks which one).
+person_alias(id uuid pk, library_id uuid not null references library,
+             person_id uuid not null references person on delete cascade,
+             alias text not null, created_by uuid references profile)
+-- index on (library_id, lower(unaccent(alias)))
+
+-- Reference faces that identify a person without anyone labeling photos: a self-enrolled
+-- selfie, a guardian-enrolled selfie of a child, or an uploaded reference photo.
+-- Stored as plain vectors because they are searched against.
+person_reference(id uuid pk, library_id uuid not null references library,
+                 person_id uuid not null references person on delete cascade,
+                 embedding vector(512) not null, model_version text not null, quality real,
+                 source text not null check (source in ('self_selfie','guardian_selfie','uploaded_photo')),
+                 consent_id uuid not null references biometric_consent,
+                 created_by uuid references profile, created_at timestamptz default now())
 
 -- Photos
 photo(id uuid pk, library_id uuid not null references library,
@@ -124,11 +142,9 @@ face(id uuid pk, library_id uuid not null references library,
      person_source text check (person_source in ('manual','confirmed','auto')),
      person_confidence real)
 
--- Face sign-in (separate from photo faces; see section 5)
+-- Consent to be recognized in photos (selfie enrollment, guardian enrollment, labeling).
 biometric_consent(id uuid pk, profile_id uuid references profile, notice_version text,
                   granted_at timestamptz not null, revoked_at timestamptz)
-face_credential(id uuid pk, profile_id uuid references profile, embedding_enc bytea not null,
-                model_version text, consent_id uuid references biometric_consent, created_at timestamptz)
 
 audit_log(id bigserial pk, at timestamptz default now(), actor uuid, library_id uuid,
           action text, target text, ip inet, meta jsonb)
@@ -155,7 +171,7 @@ create policy photo_update on photo for update using (
           and m.profile_id = auth.uid() and m.role in ('owner','editor')));
 ```
 
-The API connects as the user (forwarding the JWT, `set local role authenticated` + `request.jwt.claims`) for all request-scoped reads and writes. The worker uses the service role and always sets `library_id` explicitly. `face_credential`, `biometric_consent`, and `audit_log` have **no** user-facing select policy; only the service role touches them.
+The API connects as the user (forwarding the JWT, `set local role authenticated` + `request.jwt.claims`) for all request-scoped reads and writes. The worker uses the service role and always sets `library_id` explicitly. `biometric_consent` and `audit_log` have **no** user-facing select policy; only the service role touches them.
 
 **Indexes**
 
@@ -201,55 +217,32 @@ Do **not** use tag 306 (`DateTime`) as a primary source. It is the file-modified
 
 ---
 
-## 5. Authentication: sign in with name + face
+## 5. Authentication
 
-### 5.1 Threat model and the key design decision
+Sign-in is handled entirely by Supabase Auth. There is no face login.
 
-Face sign-in is convenient, but **a face photo is not a secret**. In this product the album itself is a library of photos of each member's face, so anyone who sees a family member's photos (a shared link, a compromised account, a screenshot) has the spoofing material. Therefore:
+### 5.1 Flow
 
-- Face is a **verification step on a trusted device**, not a root credential. A new device must first be bound through a stronger factor (passkey or email magic link).
-- Verification is **1:1** (does this selfie match *this* account's enrolled face), never 1:N across all users.
-- Liveness detection is required at both enrollment and login.
-- Rate limiting and lockout apply.
+1. An owner invites someone by email to a library (`POST /libraries/{id}/invites`). The invite is a single-use, expiring token tied to the email address and a role.
+2. The invitee opens the link and signs in with an **email magic link** or a **passkey**. Supabase issues a short-lived JWT plus a refresh token.
+3. The API verifies the JWT on every request (signature, expiry, audience) and passes the user id to the database, where RLS enforces access (section 3).
+4. On first sign-in a `profile` row is created with a unique `handle` and `display_name`; accepting the invite adds a `library_member` row with the invited role.
 
-### 5.2 Account and enrollment
+### 5.2 Rules
 
-1. User is invited to a library by an owner (email link). They create an account with email magic link or passkey (Supabase Auth). They pick a unique `handle` and `display_name`.
-2. Notice and consent screen (section 7). Records a `biometric_consent` row. No consent, no enrollment.
-3. Enrollment: capture 3 to 5 selfies with varied angle/lighting. Each must pass liveness and quality checks (single face, minimum size, not blurred, eyes open). The worker computes embeddings, stores them encrypted in `face_credential.embedding_enc`.
-4. The device is registered as trusted (passkey created, or a device-bound refresh token stored in the platform keychain).
+- Roles are `owner`, `editor`, `viewer`. Only owners invite, change roles, or remove members. The last owner of a library cannot be removed or demoted.
+- Invites expire after 7 days and can be revoked. Accepting requires the signed-in email to match the invited email.
+- Sessions are short-lived (JWT about 1 hour) with refresh-token rotation. A member can sign out other devices.
+- Rate-limit sign-in and invite endpoints; log sign-ins, invites, and role changes to `audit_log`.
+- Never accept `user_id` or `library_id` from the client without an RLS membership check.
 
-### 5.3 Login flow
+### 5.3 Library deletion
 
-```
-Client                         API (auth service)                  Worker/ML
-  │ POST /auth/face/start {handle, device_id}                          │
-  │ ───────────────────────────────►  rate-limit; look up profile      │
-  │ ◄─ {challenge, liveness_session}   (same response whether or not  │
-  │                                     the handle exists)             │
-  │ capture selfie + liveness proof                                    │
-  │ POST /auth/face/verify {selfie, liveness_proof, challenge} ───────►│
-  │                                    embed selfie ◄──────────────────│
-  │                                    cosine vs. enrolled templates   │
-  │                                    pass = max sim ≥ T and          │
-  │                                           device is trusted        │
-  │ ◄─ session (short-lived JWT + refresh)   fail = generic error      │
-```
+Not exposed yet (see Phase 2 limitations): deleting a library must also delete its objects in R2.
 
-Rules:
+### 5.4 Decision: no face login
 
-- **Trusted device required.** Unknown device means face is not offered; the user does magic link or passkey, then optionally enrolls the device for face unlock.
-- **Uniform errors.** Never reveal whether a handle exists or whether the face or the device failed. Constant-ish response time.
-- **Lockout:** 5 failed attempts per account per 15 minutes and 20 per IP per hour; after that, require magic link. Log every attempt to `audit_log`.
-- **Threshold `T`** is set from an evaluation (target false accept rate ≤ 1 in 10,000 on the labeled set, then add margin), not copied from a library default. Store `model_version`; re-enroll on model change.
-- **Liveness:** use an established service or on-device API (e.g. a managed face-liveness provider, or platform biometrics) rather than rolling our own. A simple "blink or turn your head" challenge is a minimum; passive liveness is better. Decide the provider in the open questions.
-- **Session minting:** Supabase Auth has no native "face" provider. After a successful verify, the server uses the admin API to create a normal Supabase session for that user so RLS (`auth.uid()`) keeps working unchanged. Confirm the exact admin call for the pinned Supabase version when implementing; keep that endpoint server-only, rate-limited, and audited.
-
-### 5.4 Face credential storage
-
-- Separate table and separate model call from photo-face search. Login templates are never mixed into the photo `face` table, and photo faces are never used to log anyone in.
-- Embeddings encrypted at the application layer (envelope encryption, key from the secret manager). Matching is done in app memory for one account's few templates, so encryption does not break search.
-- Deletion: revoking consent or deleting the account hard-deletes `face_credential` rows within 24 hours and writes an audit entry.
+Considered and rejected. A face photo is not a secret, and in this product the album is a library of each member's face, so anyone who sees a few photos has the spoofing material. Doing it safely would need liveness detection, trusted-device binding, lockout, and a second consent, for a convenience feature. Faces are used for **finding people in photos** (section 6), where a wrong match costs a mislabeled photo, not account access. If this is revisited, treat it as a separate project with its own threat model.
 
 ---
 
@@ -257,10 +250,24 @@ Rules:
 
 ### 6.1 Naming people
 
+There are two ways a person gets connected to their face. Self-enrollment (A) means most active members never have to be named by anyone else; labeling (B) covers everyone who doesn't enroll.
+
+**A. Claim yourself (optional selfie)**
+
+1. A signed-in member opts in and accepts the *recognition* notice They take 3 to 5 selfies (varied angle and lighting; single face, minimum size, not blurred). Each becomes a `person_reference` row with `source='self_selfie'`.
+2. This creates their `person` (or claims an existing one) with `profile_id` set. Claiming a person that already has labeled faces needs approval from an owner or editor, so nobody can claim someone else's identity.
+3. A background job matches all unlabeled faces in the library against the new references. Matches above `T_auto` are stored as `auto`; matches above `T_suggest` become suggestions delivered **to that person** ("Is this you?"), not to the rest of the family. Confirming sets `person_source='confirmed'`.
+4. Selfies are recent, so older photos (large age gap) match weakly and mostly surface as suggestions. The app nudges: "Confirm a few older photos to improve results."
+5. **Children and others without accounts:** an owner or editor can enroll references for a child's `person`, which records guardian consent. This is the only case where one member's selfie upload stands in for another person.
+6. **Opting out:** a person can set `recognition_opt_out`. Their references are deleted, their `person_id` labels cleared, and they are excluded from future matching and suggestions even if someone else tries to label them.
+
+**B. Label clusters (everyone else)**
+
 1. **Cluster.** After each import, assign each new face to the nearest existing cluster in the library if cosine distance < `T_cluster`, otherwise start a new cluster. Periodically re-cluster the library (HDBSCAN or agglomerative) as a background job.
 2. **Label.** The UI shows clusters largest-first ("Who is this?"). A member names a cluster once (or merges it into an existing person); all its faces get `person_id`, `person_source='manual'`.
 3. **Suggest.** For unlabeled faces, if the nearest exemplar of any person is closer than `T_suggest`, store a suggestion; the UI asks "Is this Mia?". Confirming sets `person_source='confirmed'`. Auto-assign without confirmation only above a stricter `T_auto`, stored as `auto` and visibly marked.
-4. **Exemplars** for a person = faces with `manual`/`confirmed` source. These are what matching uses.
+4. **Exemplars** for a person = faces with `manual`/`confirmed` source plus their `person_reference` rows. These are what matching uses. A reference counts as dated at its `created_at`, so age-aware matching (6.2) treats a selfie as belonging to that era.
+5. **Aliases.** Anyone with editor rights can add nicknames to a person. A search by name matches `display_name` and every alias.
 
 ### 6.2 Age-aware matching
 
@@ -279,6 +286,7 @@ Thresholds `T_*` are parameters in config, tuned by the evaluation harness (6.4)
 | Param | Meaning |
 | --- | --- |
 | `person` (repeatable) | person ids to find |
+| `name` (repeatable) | names or nicknames, resolved case- and accent-insensitively against `display_name` and `person_alias`. If a name matches more than one person (two "Grandma"s), the response lists the candidates for the UI to choose instead of guessing |
 | `mode` | `all` (everyone in the same photo) or `any` |
 | `from`, `to` | date range, applied to `taken_at` |
 | `q` | optional free text, ranked with CLIP text embedding |
@@ -297,15 +305,15 @@ Build before tuning any threshold. Use the labeled sets already in the repo (`ap
 
 *This is engineering guidance, not legal advice. Have counsel review the notice and retention text before real users are invited.*
 
-- **Biometric data:** face embeddings are biometric identifiers. In some jurisdictions (e.g. Illinois BIPA, GDPR Art. 9, Texas CUBI) collection needs written notice, informed consent, and a published retention/destruction schedule. This applies to login templates *and* to embeddings of people in photos, including children and people who never signed up.
-- **Consent model:** library owners accept a notice when enabling face features; each member consents separately for face login. Persons without accounts are labeled by a member; provide "remove this person's face data" which deletes their embeddings and unlinks `person_id`.
-- **Retention:** delete biometrics on account/person deletion and on consent revocation. Default cap of 3 years after last activity for login templates, owner-configurable.
+- **Biometric data:** face embeddings are biometric identifiers. In some jurisdictions (e.g. Illinois BIPA, GDPR Art. 9, Texas CUBI) collection needs written notice, informed consent, and a published retention/destruction schedule. This applies to the embeddings of every face in photos, including children and people who never signed up, and to selfie references.
+- **Consent model:** library owners accept a notice when enabling face features. Each member consents separately to *recognition* (being matched in photos, including selfie enrollment); a person who does not consent can set `recognition_opt_out`. Revoking recognition deletes that person's `person_reference` rows and clears their labels (see `recognition_opt_out`). Persons without accounts are labeled by a member; provide "remove this person's face data" which deletes their embeddings and unlinks `person_id`.
+- **Retention:** delete biometrics on account/person deletion and on consent revocation. Default cap of 3 years after last activity for selfie references, owner-configurable.
 - **Secrets:** move credentials out of `.env` into a secret manager for deployed environments; `.env` is gitignored and never committed. Rotate R2, Hugging Face, and database credentials before the repo is ever pushed anywhere, since `.env` has lived unprotected in a non-git directory.
-- **Transport/storage:** TLS everywhere; provider encryption at rest; app-level encryption for `face_credential`.
+- **Transport/storage:** TLS everywhere; provider encryption at rest. Face embeddings are not encrypted at the column level because they must be searched; access is limited by RLS and the service role.
 - **Input hardening:** upload size cap, content-type sniffing (not trusting the extension), pixel cap, per-user upload rate limits, strict CORS to the web origin.
 - **Authorization:** all request-scoped DB access runs under RLS. No endpoint accepts a `user_id` from the body or form (the prototype does).
 - **Logging:** structured logs with request id, user id, library id; no face images, embeddings, or signed URLs in logs.
-- **Audit:** `audit_log` for login attempts, role changes, person deletion, biometric consent changes, bulk exports.
+- **Audit:** `audit_log` for invites, role changes, person deletion, biometric consent changes, bulk exports.
 - **Export/delete:** a member can export their uploaded originals and delete their account; an owner can delete a library (cascades to R2 objects via a cleanup job).
 
 ---
@@ -314,7 +322,7 @@ Build before tuning any threshold. Use the labeled sets already in the repo (`ap
 
 - **Local dev:** `docker compose up` brings up Postgres (pgvector + PostGIS image), a local S3-compatible store (MinIO) in place of R2, the API, and the worker. `make dev` wraps it.
 - **Migrations:** Alembic, one baseline plus incremental. RLS policies live in migrations.
-- **Tests:** `pytest`. Unit tests for date ladder, filename parsing, clustering assignment, age-window matching; integration tests against a throwaway Postgres with RLS **specifically asserting that user A in library 1 cannot read library 2** (the most important test in the repo); login flow tests with mocked liveness and embeddings.
+- **Tests:** `pytest`. Unit tests for date ladder, filename parsing, clustering assignment, age-window matching; integration tests against a throwaway Postgres with RLS **specifically asserting that user A in library 1 cannot read library 2** (the most important test in the repo); invite and role-rule tests (last owner cannot be removed, invite email must match).
 - **CI (GitHub Actions):** ruff, mypy, pytest with a Postgres service, migration up/down check.
 - **Observability:** structured JSON logs, Sentry for errors, metrics for queue depth, per-photo processing seconds, failure rate, search latency (p50/p95), face-login success/failure by reason (internal only).
 - **Backups:** Supabase point-in-time recovery; R2 object versioning plus a periodic copy of originals to a second bucket or provider. Originals are the irreplaceable asset.
@@ -329,7 +337,7 @@ Build before tuning any threshold. Use the labeled sets already in the repo (`ap
 app/
   main.py                  # app factory, router wiring only
   config.py                # pydantic-settings; thresholds with eval-run citations
-  auth/                    # JWT dependency, RLS session, face login routes
+  auth/                    # JWT dependency, RLS session, invites and roles
   api/                     # uploads.py, photos.py, people.py, search.py, albums.py, admin.py
   db/                      # session.py, models.py
   services/                # storage.py, metadata.py, faces.py, clip.py, clustering.py, matching.py
@@ -403,15 +411,33 @@ Implemented as the **expand** half of an expand/contract migration: new structur
 - `0002` drops `profile.face_embedding` (unconsented biometric data, unused). The downgrade re-adds it empty.
 - Backfill role mapping: heaviest uploader becomes `owner`; anyone who uploaded a photo or created an album becomes `editor`; everyone else `viewer`. Review the result before inviting anyone.
 
-### Phase 2: Auth (email and passkey) and membership
+### Phase 2: Auth (email and passkey) and membership (done)
 
-- [ ] Supabase Auth JWT verification dependency (`app/auth/`).
-- [ ] Profile creation on first sign-in; `handle` uniqueness.
-- [ ] Library creation, invite-by-email, role management endpoints.
-- [ ] Remove `user_id` from every form and body; derive it from the token.
-- [ ] Contract: drop `photo.user_id` and the `albummemberlink` table; make `photo.library_id` NOT NULL; add `profile.id` FK to `auth.users`.
+- [x] Supabase JWT verification (`app/auth/jwt.py`): ES256/RS256 only, public keys from the project's JWKS endpoint, signature + expiry + audience + issuer + subject required; HS256 and `alg: none` rejected.
+- [x] Profile creation on first sign-in (`app/auth/profiles.py`); unique `handle`.
+- [x] `GET/PATCH /api/me`; libraries (`/api/libraries`): create, list, rename, members (list, change role, remove, leave), invites (create, list, revoke); `POST /api/invites/accept`.
+- [x] Invites: single-use, 7-day expiry, bound to an email and a role, token returned once and stored only as a SHA-256 hash; accepting requires the signed-in, verified email to match. Delivery is by link that the owner shares (no email sending, so no service-role key is needed).
+- [x] Last-owner guard in the database (trigger), plus owner-only member management in RLS.
+- [x] Every prototype route requires sign-in and takes the user from the token; `user_id` is gone from all requests. Uploads go into a library the caller can write to; image serving checks library membership; `wipe-data` is dev-only, per library, owners only.
+- [x] RLS session re-applies the user identity on every transaction (`after_begin`), so code after a mid-request `commit()` cannot silently run as the table owner.
+- [x] `/login` developer page and `/api/config` (public project URL and publishable key only).
+- [x] Audit log entries for library, invite and role events. Audit failures are logged and never fail a completed request.
+- [x] Migrations `0004` (invites, last-owner trigger) and `0005` (drop `photo.user_id`, `albummemberlink`, `face_credential`; `photo.library_id` and `uploader_id` required; `profile.id` FK to `auth.users`, added NOT VALID).
+- [x] `scripts/link_owner.py`: re-points a pre-existing profile (library membership, uploads, albums) to a real sign-in account in one transaction; dry run by default.
+- [x] Tests: token checks, 20 endpoint tests (roles, invites, isolation, audit), anonymous-access test over every prototype route, rehearsed migrations on a database shaped like production.
 
-**Done when:** all endpoints reject anonymous requests and no endpoint accepts a client-supplied user id.
+**Remaining owner steps**
+
+- [x] Set `SUPABASE_ANON_KEY`, sign in at `/login`, and run `scripts/link_owner.py --apply` (done: the existing library and 4 photos now belong to the owner's real account; `profile_id_auth_fkey` validated).
+
+**Known limitations (accepted for now)**
+
+- Library deletion is intentionally not exposed: it would orphan the library's files in R2. A cleanup job arrives with Phase 3/7.
+- Supabase lets anyone request a sign-in link, so strangers can create an account. They can see nothing (no library membership, RLS) but it is noise; add captcha or disable public sign-up later.
+- Supabase's built-in email sender is rate-limited; set up a custom SMTP provider before inviting many people.
+- Passkeys are available in Supabase Auth but not wired into `/login`; the real client (Phase 6) adds them.
+
+**Done when:** all endpoints reject anonymous requests and no endpoint accepts a client-supplied user id. (Verified by `tests/test_prototype_routes_require_auth.py` and against the running app.)
 
 ### Phase 3: Ingestion
 
@@ -431,40 +457,34 @@ Implemented as the **expand** half of an expand/contract migration: new structur
 - [ ] Re-embed existing photos (migration job) and drop old vectors.
 - [ ] Clustering service and `recluster` job.
 - [ ] People endpoints: list clusters, name or merge, confirm or reject suggestion, delete person data.
+- [ ] Migration: add `person_alias`, `person_reference`, `person.recognition_opt_out`, with RLS (editors write; members read; references readable only by editors and the person themselves).
+- [ ] Aliases: add/remove endpoints; name resolution shared with search.
+- [ ] Self-enrollment: recognition consent, selfie quality checks, claim-yourself endpoint, owner/editor approval when claiming an already-labeled person, backfill-match job.
+- [ ] Guardian enrollment for a child's person; opt-out and data deletion.
+- [ ] "Is this you?" suggestion inbox for the enrolled person.
 - [ ] `scripts/eval_faces.py` and first committed eval report.
 
 - [ ] Contract: rename `face.face_embedding` to `embedding`; drop `face.album_id` and `photo.album_id` (replaced by `album_photo`).
 
-**Done when:** on the labeled folders the eval reports precision ≥ 0.95 at the chosen thresholds, and thresholds in `config.py` cite that report.
+**Done when:** on the labeled folders the eval reports precision ≥ 0.95 at the chosen thresholds, and thresholds in `config.py` cite that report; a member who enrolls selfies is matched in the library's photos without anyone labeling them; opting out removes their references and labels and stops all future matches.
 
 ### Phase 5: Search
 
 - [ ] Single `GET /search` per section 6.3 with keyset pagination and signed thumbnail URLs.
 - [ ] Age-window matching (6.2).
+- [ ] Name search through aliases, with disambiguation when a name matches several people.
 - [ ] Delete `search_face.py`, `search_faces_in_db.py`, and the old `/search` router.
 
 **Done when:** "person X, from A to B" returns only photos dated in range, with bbox and match kind, and p95 latency is under 500 ms on a 20k-photo library.
 
-### Phase 6: Face sign-in
-
-- [ ] Decide the liveness provider (open question 1).
-- [ ] `biometric_consent` flow and notice text (legal review).
-- [ ] Enrollment endpoint, encrypted `face_credential`, trusted-device registration.
-- [ ] `/auth/face/start` and `/auth/face/verify` with rate limiting, uniform errors, lockout, audit.
-- [ ] Session minting via the Supabase admin API.
-- [ ] Threshold `T` chosen from an eval run targeting FAR ≤ 1e-4.
-- [ ] Revocation and deletion job.
-
-**Done when:** a registered trusted device can sign in by name and face; an unknown device cannot; a printed photo or screen replay of an enrolled face is rejected by liveness in manual testing; lockout and audit entries verified.
-
-### Phase 7: Client
+### Phase 6: Client
 
 - [ ] PWA (or native) with: upload and progress, people grid, "who is this?" naming, search with person chips and a timeline scrubber, photo viewer with face boxes, date editing.
 - [ ] Device import (iOS photo library) if native is chosen (open question 3).
 
 **Done when:** a non-technical family member can onboard, import, and find "Mia, 2019" without help.
 
-### Phase 8: Production readiness
+### Phase 7: Production readiness
 
 - [ ] Staging and prod environments; secret manager; Dockerfiles for API and worker.
 - [ ] Sentry, metrics, dashboards, alerts on queue depth and failure rate.
@@ -490,9 +510,8 @@ Implemented as the **expand** half of an expand/contract migration: new structur
 
 ## 12. Open questions for the owner
 
-1. **Liveness provider:** managed service (cost, vendor data handling) or on-device platform biometrics (iOS/Android) for face unlock? This also affects whether a PWA is enough.
-2. **Hosting:** stay on Supabase and R2, or self-host Postgres? Affects the secret-manager and backup choices.
-3. **Client:** PWA only, or a native iOS app for photo-library import?
-4. **Library model:** one library per family is assumed. Do you need people shared across two libraries (e.g. two sides of a family)?
-5. **Legal:** which jurisdictions will members be in? That decides the consent and retention text.
-6. **Existing data:** can `ex_photos/` and `bsmall/` (COCO images) be deleted from the repo? They look like test fixtures unrelated to family photos.
+1. **Hosting:** stay on Supabase and R2, or self-host Postgres? Affects the secret-manager and backup choices.
+2. **Client:** PWA only, or a native iOS app for photo-library import?
+3. **Library model:** one library per family is assumed. Do you need people shared across two libraries (e.g. two sides of a family)?
+4. **Legal:** which jurisdictions will members be in? That decides the consent and retention text.
+5. **Existing data:** can `ex_photos/` and `bsmall/` (COCO images) be deleted from the repo? They look like test fixtures unrelated to family photos.

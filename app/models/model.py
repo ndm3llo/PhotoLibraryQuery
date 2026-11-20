@@ -2,7 +2,7 @@
 
 The database schema is owned by Alembic (migrations/). These classes are for querying only;
 never call SQLModel.metadata.create_all. Columns marked LEGACY are still read by the
-prototype endpoints and are dropped in later phases (see migrations/versions/0002).
+prototype endpoints and are dropped in later phases (see migrations/versions/).
 """
 from datetime import date, datetime
 from typing import Any, List, Optional
@@ -81,9 +81,9 @@ class AlbumPhoto(SQLModel, table=True):
 class Photo(SQLModel, table=True):
     id: UUID = Field(default_factory=uuid4, primary_key=True)
 
-    # Tenancy (nullable until Phase 2 removes the legacy upload path)
-    library_id: Optional[UUID] = Field(default=None, foreign_key="library.id")
-    uploader_id: Optional[UUID] = Field(default=None, foreign_key="profile.id")
+    # Tenancy
+    library_id: UUID = Field(foreign_key="library.id")
+    uploader_id: UUID = Field(foreign_key="profile.id")
 
     # Processing state
     status: str = Field(default="pending")  # pending | processing | ready | failed | duplicate
@@ -109,7 +109,6 @@ class Photo(SQLModel, table=True):
     clip_embedding: Optional[List[float]] = Field(default=None, sa_column=Column(Vector(512)))
 
     # LEGACY (prototype endpoints still use these)
-    user_id: UUID = Field(foreign_key="profile.id", index=True)  # -> uploader_id (Phase 2)
     album_id: Optional[UUID] = Field(default=None, foreign_key="album.id", index=True)  # -> album_photo
     storage_path: str  # -> original_key (Phase 3)
     thumbnail_path: str  # -> thumb_key (Phase 3)
@@ -152,7 +151,23 @@ class PhotoFace(SQLModel, table=True):
     album_id: Optional[UUID] = Field(default=None, foreign_key="album.id", index=True)
 
 
-# --- Face sign-in and audit: service-role access only (no user-facing RLS policy) ---
+# --- Consent and invites ---
+
+
+class LibraryInvite(SQLModel, table=True):
+    __tablename__ = "library_invite"
+
+    id: UUID = Field(default_factory=uuid4, primary_key=True)
+    library_id: UUID = Field(foreign_key="library.id")
+    email: str
+    role: str
+    token_hash: str
+    created_by: UUID = Field(foreign_key="profile.id")
+    created_at: Optional[datetime] = None
+    expires_at: datetime
+    accepted_at: Optional[datetime] = None
+    accepted_by: Optional[UUID] = Field(default=None, foreign_key="profile.id")
+    revoked_at: Optional[datetime] = None
 
 
 class BiometricConsent(SQLModel, table=True):
@@ -163,14 +178,3 @@ class BiometricConsent(SQLModel, table=True):
     notice_version: str
     granted_at: datetime
     revoked_at: Optional[datetime] = None
-
-
-class FaceCredential(SQLModel, table=True):
-    __tablename__ = "face_credential"
-
-    id: UUID = Field(default_factory=uuid4, primary_key=True)
-    profile_id: UUID = Field(foreign_key="profile.id")
-    embedding_enc: bytes
-    model_version: str
-    consent_id: UUID = Field(foreign_key="biometric_consent.id")
-    created_at: Optional[datetime] = None
