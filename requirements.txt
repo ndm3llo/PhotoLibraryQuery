@@ -1,0 +1,34 @@
+# Pinned to the versions currently working in .venv (Python 3.11).
+
+# Web Server
+fastapi==0.128.5
+uvicorn==0.40.0
+python-multipart==0.0.22
+
+# Database
+sqlmodel==0.0.32
+SQLAlchemy==2.0.46
+psycopg2-binary==2.9.11
+pgvector==0.4.2
+GeoAlchemy2==0.18.1
+alembic==1.16.5
+
+# Cloud Storage (R2/S3)
+boto3==1.42.44
+
+# AI & Processing
+pillow==12.1.0
+pillow-heif==1.2.0
+ImageHash==4.3.2
+sentence-transformers==5.2.2
+torch==2.10.0
+numpy==2.4.2
+deepface==0.0.99
+retina-face==0.0.17
+tensorflow==2.20.0
+tf_keras==2.20.1
+opencv-python==4.13.0.92
+
+# Utilities
+requests==2.32.5
+python-dotenv==1.2.1

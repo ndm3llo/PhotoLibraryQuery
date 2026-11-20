@@ -1,0 +1,16 @@
+# Local development services. Production uses Supabase + Cloudflare R2.
+services:
+  db:
+    build: ./docker/db
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: photos
+    ports:
+      - "5433:5432"
+    volumes:
+      - dbdata:/var/lib/postgresql/data
+      - ./docker/db/supabase_stub.sql:/docker-entrypoint-initdb.d/00-supabase-stub.sql:ro
+
+volumes:
+  dbdata:

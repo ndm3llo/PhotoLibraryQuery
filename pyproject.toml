@@ -1,0 +1,14 @@
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+extend-exclude = [".venv", "ex_photos", "bsmall", "app_imgs"]
+
+[tool.ruff.lint]
+# Errors, pyflakes, import sorting. Widen later.
+select = ["E", "F", "I"]
+# Existing prototype code has long lines and unsorted imports; fixed as files are touched.
+ignore = ["E501"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
