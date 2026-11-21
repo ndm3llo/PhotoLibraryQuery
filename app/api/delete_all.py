@@ -8,7 +8,7 @@ from app.auth.deps import current_user, get_rls_session, require_role
 from app.auth.jwt import AuthUser
 from app.config import app_env
 from app.db.audit import audit
-from app.services.storage import storage_service
+from app.services.storage import get_storage
 
 router = APIRouter()
 
@@ -36,10 +36,11 @@ async def delete_all_photos(
     ).all()
 
     deleted_files = 0
+    storage = get_storage()
     for row in rows:
         for key in {k for k in row if k}:
             try:
-                storage_service.delete_image(key)
+                storage.delete(key)
                 deleted_files += 1
             except Exception as e:
                 print(f"R2 delete error for {key}: {e}")

@@ -1,4 +1,4 @@
-"""Every route of the prototype API must reject anonymous callers (except the public health check)."""
+"""Every API route must reject anonymous callers (except the public health check and login page)."""
 import re
 import sys
 import types
@@ -17,10 +17,7 @@ def _stub_heavy_modules(monkeypatch):
     ai.ai_service = object()
     faces = types.ModuleType("app.services.img_face_recognition")
     faces.extract_face_embeddings = lambda b: []
-    storage = types.ModuleType("app.services.storage")
-    storage.storage_service = object()
-    for name, mod in [("app.services.ai", ai), ("app.services.img_face_recognition", faces),
-                      ("app.services.storage", storage)]:
+    for name, mod in [("app.services.ai", ai), ("app.services.img_face_recognition", faces)]:
         monkeypatch.setitem(sys.modules, name, mod)
 
 
@@ -31,23 +28,21 @@ def app_with_all_routes(app_db, monkeypatch):
     from app.api import (
         base,
         delete_all,
-        images,
         libraries,
         me,
+        photos,
         search,
         search_face,
         search_faces_in_db,
-        upload,
-        upload_folder,
+        uploads,
     )
     app = FastAPI()
     app.include_router(base.router)
     app.include_router(me.router, prefix="/api/me")
     app.include_router(libraries.router, prefix="/api/libraries")
     app.include_router(libraries.invites_router, prefix="/api/invites")
-    app.include_router(images.router, prefix="/api/images")
-    app.include_router(upload.router, prefix="/api/upload")
-    app.include_router(upload_folder.router, prefix="/api/folder")
+    app.include_router(uploads.router, prefix="/api/uploads")
+    app.include_router(photos.router, prefix="/api/photos")
     app.include_router(search.router, prefix="/api/search")
     app.include_router(search_face.router, prefix="/api/search-face")
     app.include_router(search_faces_in_db.router, prefix="/api/debug")
@@ -59,7 +54,7 @@ def _concrete(path: str) -> str:
     return re.sub(r"\{[^}]+\}", "00000000-0000-0000-0000-000000000000", path)
 
 
-def test_all_prototype_routes_reject_anonymous_requests(app_with_all_routes):
+def test_all_api_routes_reject_anonymous_requests(app_with_all_routes):
     client = TestClient(app_with_all_routes, raise_server_exceptions=False)
     checked = []
     for route in app_with_all_routes.routes:
@@ -72,7 +67,7 @@ def test_all_prototype_routes_reject_anonymous_requests(app_with_all_routes):
                 r = client.request(method, _concrete(route.path), headers=headers, json={})
                 assert r.status_code == 401, f"{method} {route.path} -> {r.status_code} with headers={headers}"
             checked.append((method, route.path))
-    assert len(checked) >= 20, f"suspiciously few routes checked: {checked}"
+    assert len(checked) >= 24, f"suspiciously few routes checked: {checked}"
 
 
 def test_login_page_and_config_are_public_but_never_leak_secrets(app_db, monkeypatch):
@@ -88,6 +83,8 @@ def test_login_page_and_config_are_public_but_never_leak_secrets(app_db, monkeyp
     assert page.status_code == 200 and "Email me a sign-in link" in page.text
     assert page.headers["x-frame-options"] == "DENY" and page.headers["cache-control"] == "no-store"
     assert client.get("/invite").status_code == 200
+    upload = client.get("/upload")
+    assert upload.status_code == 200 and "Upload photos" in upload.text and upload.headers["x-frame-options"] == "DENY"
 
     cfg = client.get("/api/config")
     assert cfg.json() == {"supabase_url": "https://test.supabase.co", "supabase_anon_key": "sb_publishable_testkey"}

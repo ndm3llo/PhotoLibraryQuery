@@ -439,17 +439,46 @@ Implemented as the **expand** half of an expand/contract migration: new structur
 
 **Done when:** all endpoints reject anonymous requests and no endpoint accepts a client-supplied user id. (Verified by `tests/test_prototype_routes_require_auth.py` and against the running app.)
 
-### Phase 3: Ingestion
+### Phase 3: Ingestion (done; one owner step remains)
 
-- [ ] `POST /uploads` and `/uploads/complete` with presigned PUT; MinIO for local dev.
-- [ ] Procrastinate worker with `process_photo`, retries, `status` and `error`.
-- [ ] HEIC decode, EXIF transpose, WebP display and thumb, sha256 dedup, pHash flag.
-- [ ] Date ladder with provenance; unit tests with fixtures covering each rung.
-- [ ] Private bucket plus signed GET endpoint; remove `R2_PUBLIC_URL` use and the `.dev/` string splitting.
-- [ ] `scripts/bulk_import.py` that drives the real API.
-- [ ] Contract: drop `photo.storage_path`, `thumbnail_path`, `p_hash`, `captured_at` (replaced by keys, `phash`, `taken_at`).
+**Decisions (owner, 2026-11-20)**
 
-**Done when:** importing `app_imgs/` produces `ready` photos with correct orientation, sensible `taken_at_source`, and a killed worker mid-batch resumes without duplicates.
+1. **Existing data:** the 4 photos already in the database are test data and may be deleted; no migration of old R2 objects. New object keys are library-scoped: `{library_id}/originals/{photo_id}`, `{library_id}/display/{photo_id}.webp`, `{library_id}/thumbs/{photo_id}.webp`. The bucket becomes private (owner turns off public access in Cloudflare once the new flow works).
+2. **Queue:** a small Postgres table queue (`SELECT ... FOR UPDATE SKIP LOCKED`, lease with expiry, attempts, exponential backoff, dead-letter status) instead of Procrastinate. Reasons: works through the Supabase transaction pooler (Procrastinate needs a session/direct connection for LISTEN/NOTIFY), no extra dependency, and plenty for this scale. Revisit if throughput or scheduling needs outgrow it.
+3. **Two stages:** `process_photo` (fast: copies, dates, status `ready`) then `enrich_photo` (CLIP and faces, re-runnable per `model_version`), so Phase 4 can re-embed without re-importing.
+4. **Originals are kept byte-for-byte** (HEIC stays HEIC; no JPEG re-save). Alongside: a WebP display copy and a WebP thumbnail. Photos only; no video or Live Photos.
+5. **Hosting:** the owner plans to run on a cloud server. The API and worker are separate processes configured only by environment variables, so both containerize cleanly in Phase 7. Worker needs enough RAM for the ML models.
+6. **Limits:** JPEG, PNG, HEIC, WebP; 50 MB per file (revisit for RAW).
+
+**Owner steps for this phase**
+
+- [x] Add the CORS policy in `infra/r2-cors.json` to the R2 bucket (done and verified live by `scripts/check_storage.py`: preflight allows the origin and `PUT`, refuses a foreign origin).
+- [ ] Turn off public access on the bucket (Cloudflare: R2 > bucket > Settings > Public access / r2.dev subdomain / custom domain). `scripts/check_storage.py` currently reports `STILL PUBLIC`. Nothing in the app uses the public URL any more, so this is safe to do now.
+- [ ] When a real domain exists, add its origin to the CORS policy (never `*` for uploads).
+
+**Tasks (all done)**
+
+- [x] `POST /api/uploads` and `/api/uploads/complete` with presigned PUT. Only `Content-Type` is signed; boto3 checksum headers disabled (`request_checksum_calculation="when_required"`). Per-file validation (type by content-type or extension, 50 MB cap), library-scoped keys, owners and editors only, completion verifies existence and size and is idempotent.
+- [x] Table-based job queue (`app/services/jobs.py`) and worker (`python -m app.worker`): `FOR UPDATE SKIP LOCKED`, leases, at-least-once redelivery after a crash, exponential backoff, dead-letter, permanent-failure fast path. Tested with 8 competing workers and a simulated crash.
+- [x] Stage 1 `process_photo` and stage 2 `enrich_photo` (`app/services/pipeline.py`): content-based validation (not the filename), decompression-bomb guard, EXIF orientation applied, WebP display (2048 px) and thumbnail (400 px) with ICC profile kept, original stored byte-for-byte, sha256 exact-duplicate detection per library (duplicate's storage freed), perceptual-hash near-duplicate flag, GPS to PostGIS.
+- [x] Date ladder with provenance (`app/services/extract_metadata.py`): `DateTimeOriginal` (read from the Exif sub-IFD, fixing the prototype's tag-306 bug) with UTC offset, then `DateTimeDigitized`, filename patterns (including Pixel milliseconds), then browser file mtime. Manual dates are never overwritten by reprocessing.
+- [x] Private bucket access only through signed links: `GET /api/photos/{id}/url?size=thumb|display|original` after an RLS check; thumbnails included (signed) in list, detail and search results. The old byte-proxy and public-URL code is removed.
+- [x] Photo endpoints: list (keyset pagination, newest capture date first), detail, retry failed, correct the date by hand, delete (row, faces, then files via a queued job).
+- [x] `/upload` developer page (progress per file, CORS hint on failure) and `scripts/bulk_import.py` (drives the real API; folder import with duplicate-safe re-runs).
+- [x] Contract migration `0006`: dropped `storage_path`, `thumbnail_path`, `p_hash`, `captured_at`; new photo columns; `job` table (service role only); unique content hash only applies to non-duplicates.
+- [x] Live checks: `scripts/check_storage.py` against the real R2 bucket; the whole pipeline (real HEIC photos, real CLIP and face models) against the real Supabase and R2 in a throwaway library, then cleaned up. Old test photos deleted before the migration.
+- [x] Tests: 178 total, including real HTTP uploads to an in-process S3 server (moto), the queue under concurrency and crashes, dates, imaging (orientation, color modes, HEIC round trip, bombs), permissions, pagination.
+
+**Done when:** importing real photos produces `ready` photos with correct orientation and sensible `taken_at_source`, and a killed worker mid-batch resumes without duplicates. (Verified: 32 sample photos decoded; crash recovery tested; live run on real infrastructure.)
+
+**Known limitations (accepted for now)**
+
+- The worker must be running (`python -m app.worker`); uploads queue up but do not process without it. Hosting it is a Phase 7 task.
+- 10 of the 32 sample photos carry no embedded date (stripped by messaging apps or screenshots) and fall back to file time. Neighbor-based date inference (guess from photos taken around the same upload) is not implemented; use the manual date correction for now, and see Phase 6 for batch date shifting.
+- Rows left in `pending` (the user never finished the upload) are not cleaned up yet.
+- Near-duplicate detection scans the library's hashes per photo: fine at family scale (tens of thousands), revisit if a library grows far larger.
+- moto does not verify upload signatures, so signing is covered only by the live `scripts/check_storage.py`; run it after any storage or boto3 change.
+- Search endpoints are still the prototype versions (Phase 5 replaces them), and the API process still loads the CLIP model at startup for text search.
 
 ### Phase 4: Faces and people
 
@@ -510,7 +539,7 @@ Implemented as the **expand** half of an expand/contract migration: new structur
 
 ## 12. Open questions for the owner
 
-1. **Hosting:** stay on Supabase and R2, or self-host Postgres? Affects the secret-manager and backup choices.
+1. **Hosting:** the owner plans a cloud server for the API and worker; which provider is still open. Stay on Supabase and R2 for now. Affects the secret-manager and backup choices.
 2. **Client:** PWA only, or a native iOS app for photo-library import?
 3. **Library model:** one library per family is assumed. Do you need people shared across two libraries (e.g. two sides of a family)?
 4. **Legal:** which jurisdictions will members be in? That decides the consent and retention text.

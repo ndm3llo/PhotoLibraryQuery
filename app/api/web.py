@@ -13,7 +13,7 @@ from app.config import supabase_url
 
 router = APIRouter()
 
-_PAGE = Path(__file__).resolve().parent.parent / "web" / "login.html"
+_WEB = Path(__file__).resolve().parent.parent / "web"
 _HEADERS = {
     "Cache-Control": "no-store",
     "X-Content-Type-Options": "nosniff",
@@ -33,4 +33,9 @@ def public_config():
 @router.get("/login", response_class=HTMLResponse, include_in_schema=False)
 @router.get("/invite", response_class=HTMLResponse, include_in_schema=False)
 def login_page():
-    return HTMLResponse(_PAGE.read_text(encoding="utf-8"), headers=_HEADERS)
+    return HTMLResponse((_WEB / "login.html").read_text(encoding="utf-8"), headers=_HEADERS)
+
+
+@router.get("/upload", response_class=HTMLResponse, include_in_schema=False)
+def upload_page():
+    return HTMLResponse((_WEB / "upload.html").read_text(encoding="utf-8"), headers=_HEADERS)

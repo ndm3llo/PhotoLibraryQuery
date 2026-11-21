@@ -49,3 +49,33 @@ def app_db():
     os.environ["DATABASE_URL"] = db.url
     yield db
     db.drop()
+
+
+@pytest.fixture(scope="session")
+def s3_endpoint():
+    """An in-process S3-compatible server (moto), so upload tests need no external service.
+    NOTE: moto does not verify signatures, so signing problems (e.g. R2 rejecting checksum headers)
+    are only caught by the live check in scripts/check_storage.py."""
+    import socket
+
+    from moto.server import ThreadedMotoServer
+
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+    server = ThreadedMotoServer(ip_address="127.0.0.1", port=port, verbose=False)
+    server.start()
+    yield f"http://127.0.0.1:{port}"
+    server.stop()
+
+
+@pytest.fixture(scope="session")
+def storage(s3_endpoint):
+    from app.services.storage import Storage, set_storage
+
+    st = Storage.create(endpoint_url=s3_endpoint, access_key="test", secret_key="test", bucket="test-bucket",
+                        region="us-east-1")  # R2 uses "auto"; moto needs a real region
+    st.client.create_bucket(Bucket="test-bucket")
+    set_storage(st)
+    yield st
+    set_storage(None)

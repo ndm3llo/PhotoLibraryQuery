@@ -7,6 +7,7 @@ from sqlmodel import Session, select
 from app.auth.deps import get_rls_session
 from app.models.model import Photo, PhotoFace
 from app.services.img_face_recognition import extract_face_embeddings
+from app.services.storage import get_storage
 
 router = APIRouter()
 
@@ -38,16 +39,17 @@ async def search_by_face(
     statement = statement.where(distance_expr < 0.6).order_by(distance_expr.asc()).limit(50)
     results = session.exec(statement).all()
 
+    storage = get_storage()
     unique_matches = {}
     for photo, dist in results:
         if photo.id not in unique_matches:
             unique_matches[photo.id] = {
                 "photo_id": photo.id,
                 "library_id": photo.library_id,
-                "view_url": f"/api/images/view/{photo.original_key}" if photo.original_key else None,
-                "thumbnail_url": f"/api/images/view/{photo.thumb_key}" if photo.thumb_key else None,
+                "display_url": storage.presign_get(photo.display_key) if photo.display_key else None,
+                "thumbnail_url": storage.presign_get(photo.thumb_key) if photo.thumb_key else None,
                 "confidence_score": round(1 - float(dist), 4),
-                "captured_at": photo.captured_at,
+                "taken_at": photo.taken_at,
             }
 
     return {

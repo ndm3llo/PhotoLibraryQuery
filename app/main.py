@@ -5,19 +5,17 @@ from fastapi import FastAPI
 from app.api import (
     base,
     delete_all,
-    images,
     libraries,
     me,
+    photos,
     search,
     search_face,
     search_faces_in_db,
-    upload,
-    upload_folder,
+    uploads,
     web,
 )
 from app.db.session import init_db
 from app.services.ai import ai_service  # noqa: F401  (eager model load at startup)
-from app.services.storage import storage_service  # noqa: F401  (eager init)
 
 
 @asynccontextmanager
@@ -44,13 +42,9 @@ app.include_router(me.router, prefix="/api/me", tags=["Account"])
 app.include_router(libraries.router, prefix="/api/libraries", tags=["Libraries"])
 app.include_router(libraries.invites_router, prefix="/api/invites", tags=["Libraries"])
 
-# --- General Photo Access ---
-# This covers single viewing and your new batch ZIP downloader
-app.include_router(images.router, prefix="/api/images", tags=["Images"])
-
-# --- Uploading ---
-app.include_router(upload.router, prefix="/api/upload", tags=["Upload"])
-app.include_router(upload_folder.router, prefix="/api/folder", tags=["Upload"])
+# --- Photos: direct-to-storage uploads, browsing, signed image links ---
+app.include_router(uploads.router, prefix="/api/uploads", tags=["Photos"])
+app.include_router(photos.router, prefix="/api/photos", tags=["Photos"])
 
 # --- Searching ---
 app.include_router(search.router, prefix="/api/search", tags=["Search"])

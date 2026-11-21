@@ -30,6 +30,12 @@
       <input id="email" type="email" autocomplete="email" required placeholder="you@example.com">
       <button type="submit">Email me a sign-in link</button>
     </form>
+    <form id="codeform" hidden>
+      <p class="muted">Prefer a code? Type the one from the email instead of tapping the link.</p>
+      <label for="code">Code from the email</label>
+      <input id="code" inputmode="numeric" autocomplete="one-time-code" maxlength="10" placeholder="123456">
+      <button type="submit">Sign in with code</button>
+    </form>
     <p id="invite-note" class="muted" hidden>You were invited to a library. Sign in with the email address the invite was sent to.</p>
   </div>
 
@@ -54,7 +60,7 @@
 (function () {
   "use strict";
   var SESSION = "album-session", INVITE = "album-invite-token";
-  var cfg = null;
+  var cfg = null, sentTo = null;
   var $ = function (id) { return document.getElementById(id); };
 
   function say(text, kind) { var m = $("msg"); m.textContent = text || ""; m.className = kind || ""; }
@@ -125,8 +131,21 @@
       method: "POST", headers: { "apikey": cfg.supabase_anon_key, "Content-Type": "application/json" },
       body: JSON.stringify({ email: email, create_user: true })
     });
-    if (r.ok) say("Check your email and click the link. You can close this tab.", "ok");
+    if (r.ok) { sentTo = email; $("codeform").hidden = false; say("Check your email: tap the link, or type the code below.", "ok"); }
     else say("Could not send the link (" + r.status + "). Wait a minute and try again.", "error");
+  });
+
+  $("codeform").addEventListener("submit", async function (e) {
+    e.preventDefault();
+    var email = sentTo || $("email").value.trim(), code = $("code").value.replace(/\s+/g, "");
+    if (!email || !code) { say("Enter your email above and the code from the email.", "error"); return; }
+    var r = await fetch(cfg.supabase_url + "/auth/v1/verify", {
+      method: "POST", headers: { "apikey": cfg.supabase_anon_key, "Content-Type": "application/json" },
+      body: JSON.stringify({ type: "email", email: email, token: code })
+    });
+    if (!r.ok) { say("That code did not work. It may have expired; request a new one.", "error"); return; }
+    adoptSession(await r.json());
+    say("", ""); render();
   });
 
   $("accept").addEventListener("click", async function () {

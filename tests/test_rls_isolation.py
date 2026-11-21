@@ -34,8 +34,8 @@ def env(app_db):
         c.execute(text("""INSERT INTO library_member VALUES
             (:l1,:ao,'owner'),(:l1,:ae,'editor'),(:l1,:av,'viewer'),(:l2,:bo,'owner')"""),
                   {"l1": L1, "l2": L2, "ao": A_OWNER, "ae": A_EDITOR, "av": A_VIEWER, "bo": B_OWNER})
-        c.execute(text("""INSERT INTO photo (id, library_id, uploader_id, storage_path, thumbnail_path, status)
-            VALUES (:p1,:l1,:ao,'s','t','ready'),(:p2,:l2,:bo,'s','t','ready')"""),
+        c.execute(text("""INSERT INTO photo (id, library_id, uploader_id, status)
+            VALUES (:p1,:l1,:ao,'ready'),(:p2,:l2,:bo,'ready')"""),
                   {"p1": P1, "p2": P2, "l1": L1, "l2": L2, "ao": A_OWNER, "bo": B_OWNER})
         c.execute(text("""INSERT INTO album (id, name, created_at, created_by, library_id)
             VALUES (:a1,'a1',now(),:ao,:l1),(:a2,'a2',now(),:bo,:l2)"""),
@@ -98,8 +98,8 @@ def test_profiles_visible_only_when_sharing_a_library_or_self(env):
 # ---------------------------------------------------------------------------- writes
 
 def _photo_insert(lib, uploader, pid=None):
-    return ("INSERT INTO photo (id, library_id, uploader_id, storage_path, thumbnail_path) "
-            "VALUES (:id, :lib, :up, 's', 't')",
+    return ("INSERT INTO photo (id, library_id, uploader_id) "
+            "VALUES (:id, :lib, :up)",
             {"id": pid or uuid.uuid4(), "lib": lib, "up": uploader})
 
 

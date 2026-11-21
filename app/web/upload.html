@@ -1,0 +1,175 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Upload photos</title>
+<style>
+  :root { color-scheme: light dark; --fg:#1d1d1f; --bg:#fafafa; --card:#fff; --muted:#6b6b70; --line:#d9d9de; --accent:#2f5bea; --ok:#2e7d32; --bad:#c62828; }
+  @media (prefers-color-scheme: dark) { :root { --fg:#f2f2f4; --bg:#161618; --card:#1f1f23; --muted:#a0a0a8; --line:#34343a; --accent:#7b9bff; --ok:#6fcf74; --bad:#ff7b72; } }
+  body { margin:0; font:16px/1.5 system-ui, sans-serif; background:var(--bg); color:var(--fg); }
+  main { max-width:44rem; margin:0 auto; padding:2rem 1rem; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:1.25rem; margin-top:1rem; }
+  h1 { font-size:1.4rem; margin:0 0 .25rem; } p { margin:.5rem 0; } .muted { color:var(--muted); font-size:.9rem; }
+  label { display:block; font-weight:600; margin:.5rem 0 .35rem; }
+  select, input[type=file] { width:100%; box-sizing:border-box; padding:.5rem; font:inherit; border:1px solid var(--line); border-radius:8px; background:transparent; color:inherit; }
+  button { font:inherit; padding:.55rem .9rem; border-radius:8px; border:1px solid var(--accent); background:var(--accent); color:#fff; cursor:pointer; margin-top:.75rem; }
+  button:disabled { opacity:.5; cursor:default; }
+  [hidden] { display:none !important; }
+  ul { list-style:none; padding:0; margin:0; }
+  li { display:grid; grid-template-columns:3.5rem 1fr; gap:.75rem; align-items:center; padding:.6rem 0; border-top:1px solid var(--line); }
+  li:first-child { border-top:0; }
+  .thumb { width:3.5rem; height:3.5rem; border-radius:8px; background:var(--line); object-fit:cover; }
+  .name { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  progress { width:100%; height:.5rem; }
+  .ok { color:var(--ok); } .bad { color:var(--bad); }
+</style>
+</head>
+<body>
+<main>
+  <h1>Upload photos</h1>
+  <p class="muted">Developer upload page. Files go straight from your browser to storage; the server only processes them afterwards.</p>
+
+  <div class="card" id="needlogin" hidden>
+    <p>You need to sign in first. <a href="/login">Sign in</a></p>
+  </div>
+
+  <div class="card" id="form" hidden>
+    <label for="library">Library</label>
+    <select id="library"></select>
+    <label for="files">Photos (JPEG, PNG, HEIC, WebP; up to 50 MB each)</label>
+    <input id="files" type="file" multiple accept="image/jpeg,image/png,image/heic,image/heif,image/webp,.heic,.heif">
+    <button id="go" disabled>Upload</button>
+    <p id="summary" class="muted" role="status"></p>
+  </div>
+
+  <div class="card" id="list-card" hidden><ul id="list"></ul></div>
+</main>
+
+<script>
+(function () {
+  "use strict";
+  var $ = function (id) { return document.getElementById(id); };
+  var CONCURRENCY = 3, BATCH = 50, POLL_MS = 2000, POLL_TIMEOUT_MS = 10 * 60 * 1000;
+  var token = null;
+
+  function session() { try { return JSON.parse(localStorage.getItem("album-session")); } catch (e) { return null; } }
+  function api(path, opts) {
+    opts = opts || {};
+    opts.headers = Object.assign({ "Authorization": "Bearer " + token }, opts.headers || {});
+    return fetch(path, opts);
+  }
+  function sleep(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
+
+  function addRow(file) {
+    var li = document.createElement("li");
+    var img = document.createElement("img"); img.className = "thumb"; img.alt = "";
+    var box = document.createElement("div");
+    var name = document.createElement("div"); name.className = "name"; name.textContent = file.name;
+    var bar = document.createElement("progress"); bar.max = 100; bar.value = 0;
+    var status = document.createElement("div"); status.className = "muted"; status.textContent = "Waiting";
+    box.append(name, bar, status); li.append(img, box); $("list").appendChild(li);
+    return {
+      progress: function (p) { bar.value = p; },
+      status: function (text, kind) { status.textContent = text; status.className = kind || "muted"; if (kind) bar.hidden = true; },
+      thumb: function (url) { img.src = url; }
+    };
+  }
+
+  function putFile(url, headers, file, onProgress) {
+    return new Promise(function (resolve, reject) {
+      var xhr = new XMLHttpRequest();
+      xhr.open("PUT", url);
+      Object.keys(headers).forEach(function (h) { xhr.setRequestHeader(h, headers[h]); });
+      xhr.upload.onprogress = function (e) { if (e.lengthComputable) onProgress(e.loaded / e.total * 100); };
+      xhr.onload = function () { xhr.status >= 200 && xhr.status < 300 ? resolve() : reject(new Error("storage said " + xhr.status)); };
+      xhr.onerror = function () { reject(new Error("network or CORS error")); };
+      xhr.send(file);
+    });
+  }
+
+  async function pool(items, worker) {
+    var next = 0;
+    async function run() { while (next < items.length) { var i = next++; await worker(items[i], i); } }
+    await Promise.all(Array.from({ length: Math.min(CONCURRENCY, items.length) }, run));
+  }
+
+  async function track(id, row) {
+    var deadline = Date.now() + POLL_TIMEOUT_MS;
+    while (Date.now() < deadline) {
+      var r = await api("/api/photos/" + id);
+      if (r.ok) {
+        var p = await r.json();
+        if (p.status === "ready") {
+          var bits = ["Ready"];
+          if (p.taken_at) bits.push("taken " + p.taken_at.slice(0, 10) + " (" + p.taken_at_source + ")");
+          else bits.push("no date found");
+          bits.push(p.location ? "location kept" : "no location");
+          row.status(bits.join(", "), "ok"); if (p.thumbnail_url) row.thumb(p.thumbnail_url); return;
+        }
+        if (p.status === "failed") { row.status("Failed: " + (p.error || "unknown error"), "bad"); return; }
+        if (p.status === "duplicate") { row.status("Already in this library (duplicate skipped)", "muted"); return; }
+        row.status("Processing…");
+      }
+      await sleep(POLL_MS);
+    }
+    row.status("Still processing; check back later", "muted");
+  }
+
+  async function start() {
+    var files = Array.from($("files").files), lib = $("library").value;
+    if (!files.length) return;
+    $("go").disabled = true; $("list").textContent = ""; $("list-card").hidden = false;
+    var rows = files.map(addRow), tracked = [];
+
+    for (var b = 0; b < files.length; b += BATCH) {
+      var chunk = files.slice(b, b + BATCH);
+      var specs = chunk.map(function (f) { return { filename: f.name, size: f.size, content_type: f.type || "", last_modified: f.lastModified }; });
+      var r = await api("/api/uploads", { method: "POST", headers: { "Content-Type": "application/json" },
+                                          body: JSON.stringify({ library_id: lib, files: specs }) });
+      if (!r.ok) { chunk.forEach(function (_, i) { rows[b + i].status("Could not start (" + r.status + ")", "bad"); }); continue; }
+      var uploads = (await r.json()).uploads, sent = [];
+
+      await pool(chunk.map(function (f, i) { return { file: f, row: rows[b + i], up: uploads[i] }; }), async function (t) {
+        if (t.up.error) { t.row.status(t.up.error, "bad"); return; }
+        t.row.status("Uploading…");
+        try { await putFile(t.up.upload_url, t.up.headers, t.file, t.row.progress); sent.push(t); t.row.progress(100); }
+        catch (e) {
+          t.row.status("Upload failed: " + e.message + ". If every file fails, the bucket's CORS rule probably does not allow " + location.origin + ".", "bad");
+        }
+      });
+
+      if (sent.length) {
+        var c = await api("/api/uploads/complete", { method: "POST", headers: { "Content-Type": "application/json" },
+                                                     body: JSON.stringify({ photo_ids: sent.map(function (t) { return t.up.photo_id; }) }) });
+        var results = c.ok ? (await c.json()).results : [];
+        sent.forEach(function (t, i) {
+          var st = results[i] && results[i].status;
+          if (st === "processing" || st === "ready") { t.row.status("Processing…"); tracked.push(track(t.up.photo_id, t.row)); }
+          else t.row.status("Upload not accepted (" + (st || c.status) + ")", "bad");
+        });
+      }
+    }
+    await Promise.all(tracked);
+    $("summary").textContent = "Done.";
+    $("go").disabled = false;
+  }
+
+  (async function () {
+    var s = session();
+    if (!s || !s.access_token || s.expires_at < Date.now() / 1000) { $("needlogin").hidden = false; return; }
+    token = s.access_token;
+    var r = await api("/api/me");
+    if (!r.ok) { $("needlogin").hidden = false; return; }
+    var me = await r.json();
+    var writable = me.libraries.filter(function (l) { return l.role !== "viewer"; });
+    if (!writable.length) { $("needlogin").hidden = false; $("needlogin").firstElementChild.textContent = "You do not have a library you can upload to yet."; return; }
+    writable.forEach(function (l) { var o = document.createElement("option"); o.value = l.id; o.textContent = l.name + " (" + l.role + ")"; $("library").appendChild(o); });
+    $("form").hidden = false;
+    $("files").addEventListener("change", function () { $("go").disabled = !$("files").files.length; $("summary").textContent = $("files").files.length + " file(s) selected"; });
+    $("go").addEventListener("click", start);
+  })();
+})();
+</script>
+</body>
+</html>

@@ -41,7 +41,7 @@ Never run it against a real Supabase project.
 ```bash
 ruff check .
 export TEST_DATABASE_URL=postgresql+psycopg2://postgres:postgres@localhost:5433/postgres
-pytest -q        # DB tests are skipped when TEST_DATABASE_URL is unset
+pytest -q        # DB tests are skipped when TEST_DATABASE_URL is unset; uploads use an in-process S3 server (moto)
 ```
 
 CI runs the same commands on every push. Tests create and drop their own throwaway databases and
@@ -72,17 +72,39 @@ python scripts/link_owner.py --email you@example.com --apply
 To invite someone, an owner calls `POST /api/libraries/{id}/invites` (try it in `/docs` after
 clicking Authorize with the token from `/login`) and sends them the returned link.
 
-## Run the (prototype) API
+## Run it
 
 ```bash
-uvicorn app.main:app --reload
+uvicorn app.main:app --reload     # the API (signs in via /login, uploads via /upload)
+python -m app.worker              # the background worker: REQUIRED for uploads to finish processing
 ```
+
+Both read `.env`. Uploads go straight from the browser to the (private) R2 bucket with short-lived
+signed links; the worker then validates each photo, fixes its orientation, finds its real capture date,
+makes web copies, detects duplicates, and adds the search and face vectors.
+
+Import a whole folder through the same API:
+
+```bash
+export ALBUM_TOKEN=<copy from /login>
+python scripts/bulk_import.py ~/Pictures/family --library <library-id>
+```
+
+Check the real bucket (signed uploads, CORS, public access) any time storage settings change:
+
+```bash
+python scripts/check_storage.py
+```
+
+R2 setup: apply `infra/r2-cors.json` as the bucket's CORS policy (add your real domain's origin when you
+have one) and turn off public access on the bucket.
 
 ## Layout
 
 - `app/`: FastAPI app (api, db, models, services)
 - `migrations/`: Alembic migrations (schema, RLS policies)
 - `docker/`, `docker-compose.yml`: local Postgres
-- `scripts/`: one-off utilities (`link_owner.py`; `bulk_upload.py` and `synch_storage.py` are stale prototypes)
+- `scripts/`: `link_owner.py`, `bulk_import.py`, `check_storage.py`
+- `infra/`: Cloudflare R2 CORS policy
 - `tests/`: pytest suite
 - `docs/`: architecture and migration plan

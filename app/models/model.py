@@ -85,17 +85,27 @@ class Photo(SQLModel, table=True):
     library_id: UUID = Field(foreign_key="library.id")
     uploader_id: UUID = Field(foreign_key="profile.id")
 
-    # Processing state
-    status: str = Field(default="pending")  # pending | processing | ready | failed | duplicate
+    # Processing state: pending (awaiting upload) | processing | ready | failed | duplicate
+    status: str = Field(default="pending")
     error: Optional[str] = None
+    enriched_at: Optional[datetime] = None
+    enrich_error: Optional[str] = None
 
-    # Storage: object keys, never full URLs
+    # Storage: object keys, never URLs. Bucket is private; clients get short-lived signed URLs.
     original_key: Optional[str] = None
     display_key: Optional[str] = None
     thumb_key: Optional[str] = None
+    content_type: Optional[str] = None
+    original_filename: Optional[str] = None
+    byte_size: Optional[int] = None
     width: Optional[int] = None
     height: Optional[int] = None
     content_sha256: Optional[str] = None
+    phash: Optional[int] = None
+    batch_id: Optional[UUID] = None
+    client_last_modified: Optional[datetime] = None
+    duplicate_of: Optional[UUID] = Field(default=None, foreign_key="photo.id")
+    near_duplicate_of: Optional[UUID] = Field(default=None, foreign_key="photo.id")
 
     # Time, with provenance
     taken_at: Optional[datetime] = None
@@ -108,12 +118,10 @@ class Photo(SQLModel, table=True):
     )
     clip_embedding: Optional[List[float]] = Field(default=None, sa_column=Column(Vector(512)))
 
-    # LEGACY (prototype endpoints still use these)
-    album_id: Optional[UUID] = Field(default=None, foreign_key="album.id", index=True)  # -> album_photo
-    storage_path: str  # -> original_key (Phase 3)
-    thumbnail_path: str  # -> thumb_key (Phase 3)
-    p_hash: Optional[str] = Field(default=None, index=True)  # -> phash (Phase 3)
-    captured_at: Optional[datetime] = Field(default=None, index=True)  # -> taken_at (Phase 3)
+    # LEGACY (dropped in Phase 4 with album_photo)
+    album_id: Optional[UUID] = Field(default=None, foreign_key="album.id", index=True)
+
+    created_at: Optional[datetime] = None
 
 
 # --- Faces ---

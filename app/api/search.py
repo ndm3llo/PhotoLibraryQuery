@@ -7,12 +7,9 @@ from sqlmodel import Session
 
 from app.auth.deps import get_rls_session
 from app.services.ai import ai_service
+from app.services.storage import get_storage
 
 router = APIRouter()
-
-
-def _view_url(key: str | None) -> str | None:
-    return f"/api/images/view/{key}" if key else None
 
 
 @router.get("/")
@@ -28,7 +25,7 @@ async def search_photos(
     # Row Level Security already limits this to the caller's libraries.
     rows = session.execute(
         text("""
-            SELECT id, library_id, uploader_id, original_key, thumb_key, captured_at,
+            SELECT id, library_id, uploader_id, display_key, thumb_key, taken_at,
                    ST_AsGeoJSON(location) AS location_json,
                    1 - (clip_embedding <=> :query_vec) AS similarity
             FROM photo
@@ -40,6 +37,7 @@ async def search_photos(
         {"query_vec": str(query_vector), "limit": limit, "lib": str(library_id) if library_id else None},
     ).all()
 
+    storage = get_storage()
     return {
         "query": query,
         "results": [
@@ -47,9 +45,9 @@ async def search_photos(
                 "id": str(r.id),
                 "library_id": str(r.library_id),
                 "uploader_id": str(r.uploader_id),
-                "view_url": _view_url(r.original_key),
-                "thumbnail_url": _view_url(r.thumb_key),
-                "captured_at": r.captured_at.isoformat() if r.captured_at else None,
+                "display_url": storage.presign_get(r.display_key) if r.display_key else None,
+                "thumbnail_url": storage.presign_get(r.thumb_key) if r.thumb_key else None,
+                "taken_at": r.taken_at.isoformat() if r.taken_at else None,
                 "location": json.loads(r.location_json) if r.location_json else None,
                 "similarity_score": round(float(r.similarity), 4),
             }
