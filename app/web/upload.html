@@ -102,7 +102,7 @@
         var p = await r.json();
         if (p.status === "ready") {
           var bits = ["Ready"];
-          if (p.taken_at) bits.push("taken " + p.taken_at.slice(0, 10) + " (" + p.taken_at_source + ")");
+          if (p.taken_local) bits.push("taken " + p.taken_local.replace("T", " ").slice(0, 16) + " (" + p.taken_at_source + ")");
           else bits.push("no date found");
           bits.push(p.location ? "location kept" : "no location");
           row.status(bits.join(", "), "ok"); if (p.thumbnail_url) row.thumb(p.thumbnail_url); return;

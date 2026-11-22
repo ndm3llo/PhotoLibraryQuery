@@ -16,7 +16,8 @@ class FakeEnrichers:
         return [0.5] * 512
 
     def faces(self, data):
-        return [[0.1] * 512]
+        from app.services.faces import DetectedFace
+        return [DetectedFace(bbox=(10, 20, 110, 140), det_score=0.9, quality=0.8, px=100, embedding=[0.1] * 512)]
 
 
 @pytest.fixture(scope="module")
@@ -98,6 +99,7 @@ def test_full_flow_upload_process_and_read_back(ctx):
     assert photo["status"] == "ready" and photo["enriched"] is True
     assert (photo["width"], photo["height"]) == (400, 600)
     assert photo["taken_at"].startswith("2019-07-04T15:30:12") and photo["taken_at_source"] == "exif_original"
+    assert photo["taken_local"] == "2019-07-04T15:30:12" and photo["taken_tz"] is None, "no offset: local = stored"
     assert photo["filename"] == "IMG_8457.JPG"
 
     thumb = httpx.get(photo["thumbnail_url"])
@@ -106,6 +108,26 @@ def test_full_flow_upload_process_and_read_back(ctx):
     assert httpx.get(original_link).content == original, "the original comes back byte-for-byte"
     display = owner.call("GET", f"/api/photos/{pid}/url").json()
     assert httpx.get(display["url"]).status_code == 200 and display["expires_in"] == 600
+
+
+def test_evening_photo_keeps_its_local_date_despite_utc(ctx):
+    """8:37 pm on Nov 20 in UTC-5 is already Nov 21 in UTC. The photo was taken on the 20th, and searches
+    for 'that day' must agree with the person who took it."""
+    owner, *_, lib = team(ctx)
+    data = make_image_bytes(date="2026:11:20 20:37:06", offset="-05:00", noise=5)
+    ids, _, _ = upload(owner, lib, [spec("IMG_2114.jpeg", data)])
+    pump(ctx)
+    photo = owner.call("GET", f"/api/photos/{ids[0]}").json()
+    assert photo["taken_at"].startswith("2026-11-21T01:37:06"), "the stored instant is UTC"
+    assert photo["taken_local"] == "2026-11-20T20:37:06" and photo["taken_tz"] == "-05:00"
+    listed = owner.call("GET", "/api/photos", params={"library_id": lib}).json()["items"][0]
+    assert listed["taken_local"] == "2026-11-20T20:37:06"
+
+    east = make_image_bytes(date="2026:11:20 01:15:00", offset="+09:00", noise=6)
+    ids2, _, _ = upload(owner, lib, [spec("IMG_9.jpeg", east)])
+    pump(ctx)
+    photo = owner.call("GET", f"/api/photos/{ids2[0]}").json()
+    assert photo["taken_at"].startswith("2026-11-19T16:15:00") and photo["taken_local"] == "2026-11-20T01:15:00"
 
 
 def test_heic_without_a_browser_type_is_accepted_by_extension(ctx):

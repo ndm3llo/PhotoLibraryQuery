@@ -5,12 +5,11 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from sqlmodel import Session, select
 
 from app.auth.deps import get_rls_session
+from app.config import FACE_AUTO_MAX, FACE_SUGGEST_MAX
 from app.models.model import Photo, PhotoFace
-from app.services.img_face_recognition import extract_face_embeddings
+from app.services import faces
 
 router = APIRouter()
-
-MATCH_THRESHOLD_DIST = 0.6  # too loose for production; retuned from an eval in Phase 4/5
 
 
 @router.post("/search-all-debug")
@@ -19,40 +18,33 @@ async def search_faces_debug(
     file: UploadFile = File(...),
     session: Session = Depends(get_rls_session),
 ):
-    """Debug: every photo in your libraries ranked by face distance, split at the threshold."""
+    """Debug: every photo in your libraries ranked by face distance, split into 'auto', 'suggest' and 'no match'
+    at the configured cutoffs."""
     contents = await file.read()
-    face_vectors = extract_face_embeddings(contents)
-    if not face_vectors:
-        raise HTTPException(status_code=400, detail="No face detected.")
+    try:
+        found = faces.detect_in_bytes(contents)
+    except Exception:
+        found = []
+    if not found:
+        raise HTTPException(status_code=400, detail="No clear face was found in the uploaded image.")
 
-    query_vector = face_vectors[0]
-    distance_expr = PhotoFace.face_embedding.cosine_distance(query_vector)
-
-    statement = select(Photo, distance_expr.label("dist")).join(PhotoFace, PhotoFace.photo_id == Photo.id)
+    distance = PhotoFace.embedding.cosine_distance(found[0].embedding)
+    statement = (select(Photo, distance.label("dist"), PhotoFace.quality)
+                 .join(PhotoFace, PhotoFace.photo_id == Photo.id)
+                 .where(PhotoFace.model_version == faces.MODEL_VERSION))
     if library_id:
         statement = statement.where(PhotoFace.library_id == library_id)
-    results = session.exec(statement.order_by(distance_expr.asc())).all()
 
-    chosen, not_chosen = [], []
-    seen_ids = set()
-    for photo, dist in results:
-        if photo.id in seen_ids:
+    tiers = {"auto": [], "suggest": [], "no_match": []}
+    seen = set()
+    for photo, dist, quality in session.exec(statement.order_by(distance.asc())).all():
+        if photo.id in seen:
             continue
-        seen_ids.add(photo.id)
-        dist_val = float(dist)
-        item = {
-            "photo_id": photo.id,
-            "key": photo.original_key,
-            "confidence_score": round(1 - dist_val, 4),
-            "distance": round(dist_val, 4),
-        }
-        (chosen if dist_val < MATCH_THRESHOLD_DIST else not_chosen).append(item)
+        seen.add(photo.id)
+        d = float(dist)
+        tier = "auto" if d <= FACE_AUTO_MAX else "suggest" if d <= FACE_SUGGEST_MAX else "no_match"
+        tiers[tier].append({"photo_id": photo.id, "key": photo.original_key, "distance": round(d, 4),
+                            "face_quality": quality})
 
-    return {
-        "chosen_keys": [c["key"] for c in chosen],
-        "not_chosen_keys": [c["key"] for c in not_chosen],
-        "threshold": 1 - MATCH_THRESHOLD_DIST,
-        "counts": {"chosen": len(chosen), "not_chosen": len(not_chosen)},
-        "chosen": chosen,
-        "not_chosen": not_chosen,
-    }
+    return {"cutoffs": {"auto_max": FACE_AUTO_MAX, "suggest_max": FACE_SUGGEST_MAX},
+            "counts": {k: len(v) for k, v in tiers.items()}, **tiers}

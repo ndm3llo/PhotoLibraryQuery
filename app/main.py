@@ -7,6 +7,7 @@ from app.api import (
     delete_all,
     libraries,
     me,
+    people,
     photos,
     search,
     search_face,
@@ -45,6 +46,9 @@ app.include_router(libraries.invites_router, prefix="/api/invites", tags=["Libra
 # --- Photos: direct-to-storage uploads, browsing, signed image links ---
 app.include_router(uploads.router, prefix="/api/uploads", tags=["Photos"])
 app.include_router(photos.router, prefix="/api/photos", tags=["Photos"])
+
+# --- People: name faces, nicknames, merge duplicates ---
+app.include_router(people.router, prefix="/api/people", tags=["People"])
 
 # --- Searching ---
 app.include_router(search.router, prefix="/api/search", tags=["Search"])

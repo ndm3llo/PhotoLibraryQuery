@@ -20,8 +20,11 @@ router = APIRouter()
 
 EDIT_ROLES = ("owner", "editor")
 LIST_COLUMNS = ("p.id, p.library_id, p.status, p.error, p.original_filename, p.width, p.height, p.taken_at, "
-                "p.taken_at_source, p.taken_at_confidence, p.thumb_key, p.created_at, p.near_duplicate_of, "
-                "coalesce(p.taken_at, p.created_at) AS sort_at")
+                "p.taken_tz, p.taken_at_source, p.taken_at_confidence, p.thumb_key, p.created_at, p.near_duplicate_of, "
+                "coalesce(p.taken_at, p.created_at) AS sort_at, "
+                # Wall-clock time where the photo was taken: the instant shifted by the camera's recorded UTC
+                # offset (no offset recorded = the stored time already is the wall-clock time).
+                "(p.taken_at AT TIME ZONE CAST(coalesce(p.taken_tz, '+00:00') AS interval)) AS taken_local")
 
 
 class DatePatch(BaseModel):
@@ -38,6 +41,8 @@ def _item(r, storage) -> dict:
         "width": r.width,
         "height": r.height,
         "taken_at": r.taken_at,
+        "taken_local": r.taken_local,
+        "taken_tz": r.taken_tz,
         "taken_at_source": r.taken_at_source,
         "taken_at_confidence": r.taken_at_confidence,
         "near_duplicate_of": r.near_duplicate_of,

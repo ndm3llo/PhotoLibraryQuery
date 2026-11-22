@@ -14,15 +14,20 @@ class FakeEnrichers:
     def __init__(self, faces=2, fail=False):
         self.calls, self.n_faces, self.fail = 0, faces, fail
         self.clip_model, self.face_model = "fake-clip", "fake-faces"
+        self.clip_inputs, self.face_inputs = [], []
 
     def clip(self, data):
         self.calls += 1
+        self.clip_inputs.append(len(data))
         if self.fail:
             raise RuntimeError("model exploded")
         return [0.5] * 512
 
     def faces(self, data):
-        return [[0.1 * (i + 1)] * 512 for i in range(self.n_faces)]
+        from app.services.faces import DetectedFace
+        self.face_inputs.append(len(data))
+        return [DetectedFace(bbox=(10 + i, 20, 110 + i, 140), det_score=0.9, quality=0.75, px=100,
+                             embedding=[0.1 * (i + 1)] * 512) for i in range(self.n_faces)]
 
 
 @pytest.fixture
@@ -109,6 +114,81 @@ def test_enrichment_adds_vectors_and_is_safe_to_repeat(env):
     run_job(env)
     with env.engine.connect() as c:
         assert c.execute(text("SELECT count(*) FROM face WHERE photo_id = :i"), {"i": pid}).scalar() == 2
+
+
+def test_faces_are_embedded_from_the_original_and_store_geometry(env):
+    data = make_image_bytes((600, 400), noise=55)
+    pid = add_photo(env.engine, env.storage, env.user, env.lib, data)
+    enqueue_process(env, pid)
+    drain(env)
+    row = photo_row(env.engine, pid)
+    assert env.enrichers.face_inputs == [len(data)], "faces see the full-resolution ORIGINAL bytes"
+    assert env.enrichers.clip_inputs == [len(env.storage.get_bytes(row["display_key"]))], "CLIP sees the smaller display copy"
+    assert row["faces_model"] == "fake-faces"
+    with env.engine.connect() as c:
+        faces = c.execute(text("SELECT bbox, det_score, quality, model_version FROM face WHERE photo_id = :i ORDER BY bbox"),
+                          {"i": pid}).all()
+    assert [list(f.bbox) for f in faces] == [[10, 20, 110, 140], [11, 20, 111, 140]]
+    assert all(abs(f.det_score - 0.9) < 1e-6 and abs(f.quality - 0.75) < 1e-6 for f in faces)
+
+
+def test_enrichment_falls_back_to_the_display_copy_when_the_original_is_gone(env):
+    pid = add_photo(env.engine, env.storage, env.user, env.lib, make_image_bytes(noise=56))
+    enqueue_process(env, pid)
+    run_job(env)  # process
+    env.storage.delete(photo_row(env.engine, pid)["original_key"])
+    run_job(env)  # enrich
+    row = photo_row(env.engine, pid)
+    assert env.enrichers.face_inputs == [len(env.storage.get_bytes(row["display_key"]))]
+    assert row["faces_model"] == "fake-faces"
+
+
+def _label_a_face(env, pid):
+    """Attach a person to the photo's first face the way a human would (manual label)."""
+    person = uuid.uuid4()
+    with env.engine.begin() as c:
+        c.execute(text("INSERT INTO person (id, library_id, display_name) VALUES (:p, :l, 'Mia')"), {"p": person, "l": env.lib})
+        face = c.execute(text("SELECT id FROM face WHERE photo_id = :i ORDER BY bbox LIMIT 1"), {"i": pid}).scalar()
+        c.execute(text("UPDATE face SET person_id = :p, person_source = 'manual' WHERE id = :f"), {"p": person, "f": face})
+    return face, person
+
+
+def test_rerunning_with_the_same_face_model_never_destroys_labels(env):
+    from app.services import jobs
+    pid = add_photo(env.engine, env.storage, env.user, env.lib, make_image_bytes(noise=57))
+    enqueue_process(env, pid)
+    drain(env)
+    face, person = _label_a_face(env, pid)
+
+    with env.svc() as s:
+        jobs.enqueue(s, "enrich_photo", {"photo_id": str(pid)})
+    run_job(env)
+    with env.engine.connect() as c:
+        rows = c.execute(text("SELECT id, person_id, person_source FROM face WHERE photo_id = :i"), {"i": pid}).all()
+    assert len(rows) == 2 and any(r.id == face and r.person_id == person and r.person_source == "manual" for r in rows)
+    assert len(env.enrichers.face_inputs) == 1, "faces were not re-detected at all"
+
+
+def test_a_new_face_model_replaces_unlabeled_faces_but_keeps_labeled_ones(env):
+    from app.services import jobs
+    pid = add_photo(env.engine, env.storage, env.user, env.lib, make_image_bytes(noise=58))
+    enqueue_process(env, pid)
+    drain(env)
+    face, person = _label_a_face(env, pid)
+
+    env.enrichers.face_model, env.enrichers.n_faces = "fake-faces-v2", 3
+    with env.svc() as s:
+        jobs.enqueue(s, "enrich_photo", {"photo_id": str(pid)})
+    run_job(env)
+    with env.engine.connect() as c:
+        rows = c.execute(text("SELECT id, model_version, person_id FROM face WHERE photo_id = :i"), {"i": pid}).all()
+    by_model = {}
+    for r in rows:
+        by_model.setdefault(r.model_version, []).append(r)
+    assert len(by_model["fake-faces-v2"]) == 3, "the new model's faces were added"
+    assert [r.id for r in by_model["fake-faces"]] == [face] and by_model["fake-faces"][0].person_id == person, \
+        "the labeled face from the old model is kept; the unlabeled one is gone"
+    assert photo_row(env.engine, pid)["faces_model"] == "fake-faces-v2"
 
 
 def test_enrichment_failure_leaves_the_photo_usable(env):

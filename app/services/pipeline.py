@@ -20,7 +20,9 @@ from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 
 from app.db.rls import service_session
-from app.services import extract_metadata, imaging, jobs
+from app.services import extract_metadata, imaging, jobs, people
+from app.services.faces import MODEL_VERSION as FACE_MODEL_VERSION
+from app.services.faces import DetectedFace
 from app.services.storage import Storage, display_key, thumb_key
 
 logger = logging.getLogger(__name__)
@@ -35,17 +37,17 @@ class PermanentJobError(Exception):
 
 @dataclass
 class Enrichers:
-    clip: Callable[[bytes], list[float]]
-    faces: Callable[[bytes], list[list[float]]]
+    clip: Callable[[bytes], list[float]]  # receives the DISPLAY copy
+    faces: Callable[[bytes], list[DetectedFace]]  # receives the ORIGINAL bytes (full resolution)
     clip_model: str = "clip-ViT-B-32"
-    face_model: str = "facenet512"
+    face_model: str = FACE_MODEL_VERSION
 
 
 def default_enrichers() -> Enrichers:
-    """Imported lazily: loading these pulls in torch/tensorflow, which only the worker should pay for."""
+    """Imported lazily: loading these pulls in torch / onnxruntime, which only the worker should pay for."""
     from app.services.ai import ai_service
-    from app.services.img_face_recognition import extract_face_embeddings
-    return Enrichers(clip=ai_service.generate_embedding_from_bytes, faces=extract_face_embeddings)
+    from app.services.faces import detect_in_bytes
+    return Enrichers(clip=ai_service.generate_embedding_from_bytes, faces=detect_in_bytes)
 
 
 @dataclass
@@ -154,33 +156,73 @@ def _mark_duplicate(session, photo_id, original_id, original_key, ctx: Context) 
 # ------------------------------------------------------------------------------- stage 2
 
 def enrich_photo(payload: dict, ctx: Context) -> str:
+    """Search vector (CLIP) and faces. Faces are detected and embedded from the full-resolution ORIGINAL.
+
+    Re-running with the same face model leaves the photo's faces alone, because people attach names to
+    faces and a re-detection would silently destroy those labels. A NEW face model replaces the old model's
+    unlabeled faces (labeled ones are kept, flagged by their different model_version)."""
     photo_id = uuid.UUID(payload["photo_id"])
     with service_session() as s:
-        row = s.execute(text("SELECT library_id, display_key, status FROM photo WHERE id = :id"),
-                        {"id": photo_id}).first()
+        row = s.execute(
+            text("SELECT library_id, display_key, original_key, status, faces_model FROM photo WHERE id = :id"),
+            {"id": photo_id}).first()
     if row is None or row.status != "ready" or not row.display_key:
         return "skipped"
 
     enrichers = ctx.enrichers()
-    data = ctx.storage.get_bytes(row.display_key)  # the 2048px copy: plenty for models, much smaller
-    vector = enrichers.clip(data)
-    faces = enrichers.faces(data)
+    display = ctx.storage.get_bytes(row.display_key)  # 2048 px copy: plenty for CLIP, much smaller to fetch
+    vector = enrichers.clip(display)
+
+    detect_faces = row.faces_model != enrichers.face_model
+    found: list[DetectedFace] = []
+    if detect_faces:
+        try:
+            original = ctx.storage.get_bytes(row.original_key, max_bytes=MAX_UPLOAD_BYTES) if row.original_key else display
+        except Exception:
+            original = display  # original unavailable: fall back to the smaller copy rather than lose the faces
+        found = enrichers.faces(original)
 
     with service_session() as s:
-        # Replace this model's faces atomically, so re-running never duplicates them.
-        s.execute(text("DELETE FROM face WHERE photo_id = :p AND model_version = :m"),
-                  {"p": photo_id, "m": enrichers.face_model})
-        for emb in faces:
-            s.execute(
-                text("INSERT INTO face (id, photo_id, library_id, face_embedding, model_version) "
-                     "VALUES (:id, :p, :l, CAST(:e AS vector), :m)"),
-                {"id": uuid.uuid4(), "p": photo_id, "l": row.library_id, "e": json.dumps(list(map(float, emb))),
-                 "m": enrichers.face_model})
+        if detect_faces:
+            s.execute(text("DELETE FROM face WHERE photo_id = :p AND (model_version = :m OR person_source IS NULL)"),
+                      {"p": photo_id, "m": enrichers.face_model})
+            for f in found:
+                s.execute(
+                    text("INSERT INTO face (id, photo_id, library_id, embedding, bbox, det_score, quality, model_version) "
+                         "VALUES (:id, :p, :l, CAST(:e AS vector), :bbox, :det, :q, :m)"),
+                    {"id": uuid.uuid4(), "p": photo_id, "l": row.library_id,
+                         "e": json.dumps([float(v) for v in f.embedding]), "bbox": list(f.bbox),
+                         "det": f.det_score, "q": f.quality, "m": enrichers.face_model})
+            s.execute(text("UPDATE photo SET faces_model = :m WHERE id = :id"), {"m": enrichers.face_model, "id": photo_id})
         s.execute(
             text("UPDATE photo SET clip_embedding = CAST(:v AS vector), enriched_at = now(), enrich_error = NULL "
                  "WHERE id = :id"),
-            {"id": photo_id, "v": json.dumps(list(map(float, vector)))})
+            {"id": photo_id, "v": json.dumps([float(v) for v in vector])})
+        if detect_faces and found:
+            # A burst of uploads collapses into one regroup: the job is delayed and deduplicated per library.
+            jobs.enqueue(s, "recluster_people", {"library_id": str(row.library_id)},
+                         dedupe_key=f"recluster:{row.library_id}", delay_seconds=30)
     return "enriched"
+
+
+def recluster_people(payload: dict, ctx: Context) -> str:
+    """Re-run automatic labels and regroup unnamed faces for one library (see app/services/people.py).
+    Repeats if more faces arrived while it was running: a job enqueued during a run is deduplicated away,
+    so the handler itself checks for leftovers."""
+    library_id = uuid.UUID(payload["library_id"])
+    model = FACE_MODEL_VERSION
+    labeled = clusters = 0
+    for _ in range(3):
+        with service_session() as s:
+            a = people.assign_library_faces(s, library_id, model)
+            c = people.recluster_library(s, library_id, model)
+            left = s.execute(text("SELECT count(*) FROM face WHERE library_id = :l AND model_version = :m "
+                                  "AND person_id IS NULL AND cluster_id IS NULL"),
+                             {"l": library_id, "m": model}).scalar()
+        labeled, clusters = a["labeled"], c["clusters"]
+        if not left:
+            break
+    return f"labeled {labeled}, {clusters} groups"
 
 
 def delete_objects(payload: dict, ctx: Context) -> str:
@@ -191,6 +233,7 @@ def delete_objects(payload: dict, ctx: Context) -> str:
 HANDLERS: dict[str, Callable[[dict, Context], str]] = {
     "process_photo": process_photo,
     "enrich_photo": enrich_photo,
+    "recluster_people": recluster_people,
     "delete_objects": delete_objects,
 }
 

@@ -27,11 +27,10 @@ ImageHash==4.3.2
 sentence-transformers==5.2.2
 torch==2.10.0
 numpy==2.4.2
-deepface==0.0.99
-retina-face==0.0.17
-tensorflow==2.20.0
-tf_keras==2.20.1
 opencv-python==4.13.0.92
+insightface==2.1          # face detection + recognition (models: NON-COMMERCIAL research license, see docs)
+onnxruntime==1.32.0
+onnx==1.23.2
 
 # Utilities
 requests==2.32.5

@@ -49,6 +49,7 @@ class Person(SQLModel, table=True):
     id: UUID = Field(default_factory=uuid4, primary_key=True)
     library_id: UUID = Field(foreign_key="library.id", index=True)
     display_name: str
+    qualifier: Optional[str] = None  # tells two people with the same name apart ("cousin")
     birth_date: Optional[date] = None
     death_date: Optional[date] = None
     profile_id: Optional[UUID] = Field(default=None, foreign_key="profile.id")
@@ -118,8 +119,7 @@ class Photo(SQLModel, table=True):
     )
     clip_embedding: Optional[List[float]] = Field(default=None, sa_column=Column(Vector(512)))
 
-    # LEGACY (dropped in Phase 4 with album_photo)
-    album_id: Optional[UUID] = Field(default=None, foreign_key="album.id", index=True)
+    faces_model: Optional[str] = None  # which face model last produced this photo's faces
 
     created_at: Optional[datetime] = None
 
@@ -136,7 +136,7 @@ class FaceCluster(SQLModel, table=True):
 
 
 class PhotoFace(SQLModel, table=True):
-    """A face found in a photo. Table is `face`; class name kept for the legacy endpoints."""
+    """A face found in a photo (table `face`)."""
 
     __tablename__ = "face"
 
@@ -144,7 +144,7 @@ class PhotoFace(SQLModel, table=True):
     photo_id: UUID = Field(foreign_key="photo.id", index=True)
     library_id: Optional[UUID] = Field(default=None, foreign_key="library.id")
 
-    face_embedding: List[float] = Field(sa_column=Column(Vector(512), nullable=False))  # -> embedding (Phase 4)
+    embedding: List[float] = Field(sa_column=Column(Vector(512), nullable=False))
     bbox: Optional[List[int]] = Field(default=None, sa_column=Column(ARRAY(Integer)))
     det_score: Optional[float] = None
     quality: Optional[float] = None
@@ -154,9 +154,6 @@ class PhotoFace(SQLModel, table=True):
     person_id: Optional[UUID] = Field(default=None, foreign_key="person.id", index=True)
     person_source: Optional[str] = None  # manual | confirmed | auto
     person_confidence: Optional[float] = None
-
-    # LEGACY: dropped in Phase 4
-    album_id: Optional[UUID] = Field(default=None, foreign_key="album.id", index=True)
 
 
 # --- Consent and invites ---

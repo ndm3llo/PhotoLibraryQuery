@@ -42,7 +42,7 @@ def env(app_db):
                   {"a1": ALB1, "a2": ALB2, "ao": A_OWNER, "bo": B_OWNER, "l1": L1, "l2": L2})
         c.execute(text("""INSERT INTO person (id, library_id, display_name)
             VALUES (:p1,:l1,'Mia'),(:p2,:l2,'Zed')"""), {"p1": PERSON1, "p2": PERSON2, "l1": L1, "l2": L2})
-        c.execute(text(f"""INSERT INTO face (id, photo_id, library_id, face_embedding)
+        c.execute(text(f"""INSERT INTO face (id, photo_id, library_id, embedding)
             VALUES (:f1,:p1,:l1,'{VEC}'),(:f2,:p2,:l2,'{VEC}')"""),
                   {"f1": FACE1, "f2": FACE2, "p1": P1, "p2": P2, "l1": L1, "l2": L2})
         # Sensitive, service-role-only rows
@@ -143,7 +143,7 @@ def test_cannot_move_own_photo_into_another_library(env):
 
 def test_users_cannot_create_faces_directly(env):
     with pytest.raises(DBAPIError, match="permission denied"):
-        q(env, A_OWNER, f"INSERT INTO face (photo_id, library_id, face_embedding) VALUES (:p,:l,'{VEC}')",
+        q(env, A_OWNER, f"INSERT INTO face (photo_id, library_id, embedding) VALUES (:p,:l,'{VEC}')",
           p=P1, l=L1)
 
 

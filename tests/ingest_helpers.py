@@ -8,7 +8,8 @@ from sqlalchemy import text
 from app.services.storage import original_key
 
 
-def make_image_bytes(size=(400, 300), color="red", fmt="JPEG", date=None, orientation=None, gps=None, noise=0):
+def make_image_bytes(size=(400, 300), color="red", fmt="JPEG", date=None, orientation=None, gps=None, noise=0,
+                     offset=None):
     from app.services import extract_metadata as em
 
     img = Image.new("RGB", size, color)
@@ -20,6 +21,8 @@ def make_image_bytes(size=(400, 300), color="red", fmt="JPEG", date=None, orient
         exif[274] = orientation
     if date:
         exif.get_ifd(em.EXIF_IFD)[em.TAG_DATETIME_ORIGINAL] = date
+        if offset:
+            exif.get_ifd(em.EXIF_IFD)[em.TAG_OFFSET_ORIGINAL] = offset
     if gps:
         exif.get_ifd(em.GPS_IFD).update(gps)
     buf = io.BytesIO()

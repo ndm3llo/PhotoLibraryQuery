@@ -15,9 +15,7 @@ def _stub_heavy_modules(monkeypatch):
     """The real modules load ML models; routes are rejected before they would ever be called."""
     ai = types.ModuleType("app.services.ai")
     ai.ai_service = object()
-    faces = types.ModuleType("app.services.img_face_recognition")
-    faces.extract_face_embeddings = lambda b: []
-    for name, mod in [("app.services.ai", ai), ("app.services.img_face_recognition", faces)]:
+    for name, mod in [("app.services.ai", ai)]:
         monkeypatch.setitem(sys.modules, name, mod)
 
 
@@ -30,6 +28,7 @@ def app_with_all_routes(app_db, monkeypatch):
         delete_all,
         libraries,
         me,
+        people,
         photos,
         search,
         search_face,
@@ -42,6 +41,7 @@ def app_with_all_routes(app_db, monkeypatch):
     app.include_router(libraries.router, prefix="/api/libraries")
     app.include_router(libraries.invites_router, prefix="/api/invites")
     app.include_router(uploads.router, prefix="/api/uploads")
+    app.include_router(people.router, prefix="/api/people")
     app.include_router(photos.router, prefix="/api/photos")
     app.include_router(search.router, prefix="/api/search")
     app.include_router(search_face.router, prefix="/api/search-face")

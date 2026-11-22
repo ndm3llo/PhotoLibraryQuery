@@ -480,20 +480,44 @@ Implemented as the **expand** half of an expand/contract migration: new structur
 - moto does not verify upload signatures, so signing is covered only by the live `scripts/check_storage.py`; run it after any storage or boto3 change.
 - Search endpoints are still the prototype versions (Phase 5 replaces them), and the API process still loads the CLIP model at startup for text search.
 
-### Phase 4: Faces and people
+### Phase 4: Faces and people (4a done; 4b in progress; 4c to 4e remain)
 
-- [ ] Swap DeepFace for InsightFace in `services/faces.py`; store bbox, score, quality, `model_version`; minimum-size filter.
-- [ ] Re-embed existing photos (migration job) and drop old vectors.
-- [ ] Clustering service and `recluster` job.
-- [ ] People endpoints: list clusters, name or merge, confirm or reject suggestion, delete person data.
-- [ ] Migration: add `person_alias`, `person_reference`, `person.recognition_opt_out`, with RLS (editors write; members read; references readable only by editors and the person themselves).
-- [ ] Aliases: add/remove endpoints; name resolution shared with search.
+**Decisions (owner, 2026-11-21)**
+
+1. **Who can name people:** owners and editors only. Viewers can see names and search by them.
+2. **Test data:** `app_imgs/` (gitignored): 7 people plus an `others/` folder of strangers, 222 photos. Many carry no metadata (they were sent through chat apps) and many are small (360 px), which is expected and useful as the hard case. Garo is evaluated from the one close-up supplied (plus a second solo face the detector found).
+3. **Use is non-commercial** (private family album), which is what makes the InsightFace models acceptable (see the license note below).
+4. **"This is me" is the preferred path** (owner, 2026-11-21): members who enroll selfies are found automatically; owners/editors still name people without accounts (children, elders, the deceased). It is offered once after joining, skippable, never nagged.
+5. **No editor approval for claiming a person.** Any member may claim an unclaimed person; a person can be claimed once; a claim never changes existing labels (selfies only produce correctable automatic matches); claims are audit-logged and the owner can unlink one. If the selfie does not resemble the person's labeled photos the member gets a warning, not a block.
+6. **Open sign-up.** Anyone can sign in, then create a group or join by an emailed invite link (invites stay bound to one email). Needs abuse limits before launch: groups per account, storage quota per group, upload rate limit.
+7. **Same name, two people:** allowed, but the pair (name, `qualifier`) is unique per library (`uq_person_name`), so two Sarahs must be told apart ("Sarah" and "Sarah, cousin"). Enrollment: a name that matches an unclaimed person offers "is this you?" with photos; a claimed one offers a new person with a qualifier; no match creates one. Search asks "which Sarah?" when ambiguous.
+
+**4a. Face model (done)**
+
+- [x] **Benchmark and switch.** Same labeled faces, same measures. Facenet512 (DeepFace, the prototype's model): nearest stranger at distance 0.48, same-person 90th percentile 0.35 (a gap of 0.13). InsightFace `buffalo_l`: nearest stranger 0.79, same-person 90th percentile 0.42 (a gap of 0.37), 99% closed-set accuracy vs 96% on the common faces, 7/7 vs 5/7 on faces under 60 px, about 4x faster. Adopted. DeepFace, RetinaFace, TensorFlow and tf_keras are removed from `requirements.txt`.
+- [x] **Zoom/crop/flip/color-order tricks tested on the old model: none helped** (they made strangers look more similar). The one real zoom is embedding from the full-resolution original, which `app/services/faces.py` does: detect on a 2048 px copy, map the landmarks back, embed from the original's pixels.
+- [x] `app/services/faces.py`: `FaceEngine` interface, `InsightFaceEngine`, `MODEL_VERSION = insightface-buffalo_l-v1`, minimum confidence 0.5 and minimum face size 32 px, `quality = det_score * min(1, px/112)`.
+- [x] Worker enrichment uses it: faces come from the original (falls back to the display copy if the original is gone), stored with bbox, det_score, quality and model version. **Re-running with the same model never touches faces** (people attach labels to them); a new model replaces only the old model's unlabeled faces. New `photo.faces_model` records which model produced a photo's faces.
+- [x] Migration `0007`: `face.face_embedding` renamed to `embedding`; legacy `photo.album_id` and `face.album_id` dropped; `photo.faces_model`. Applied to the live database; the 3 existing photos were re-processed (`scripts/reenrich.py`).
+- [x] Prototype face search switched to the new engine and cutoffs (`FACE_AUTO_MAX`, `FACE_SUGGEST_MAX` in `app/config.py`); only same-model faces are compared.
+- [x] **Evaluation harness** `scripts/eval_faces.py` (cached; `--check` fails if the auto cutoff makes any wrong or stranger match). Result on 81 known faces and 14 strangers, embedded exactly as the worker does: at `FACE_AUTO_MAX = 0.45`, 88% right, 0% wrong, 0% strangers; at `FACE_SUGGEST_MAX = 0.60`, 91% right, 0% wrong, 0% strangers. The model's few mistakes sit at distance 0.70+, so the cutoffs filter them. Nearest stranger 0.78. Cutoffs are provisional until the labeled set grows (only 14 strangers, small faces under 60 px are 9/12).
+- [x] **License.** InsightFace's code is MIT, but its pretrained models (including `buffalo_l`) and training data are "for non-commercial research purposes only" per its README (read 2025-11-21; a 2025-11-24 note routes licensing questions to recognition-oss-pack@insightface.ai). Acceptable for a private, non-commercial family album as a judgment call (not legal advice); revisit before any paid or commercial use. The model sits behind `FaceEngine` and every face records `model_version`, so it can be swapped. Fallback to benchmark with the same harness: a permissively licensed model such as OpenCV's SFace (license to be verified). The model downloads (about 280 MB) on first use; the real-model tests run only when it is present (set `RUN_FACE_MODEL_TESTS=1` in CI to force them).
+
+**4b to 4e (remaining)**
+
+- [x] Migration `0008` (written and tested, **not yet applied to the live database**): `person_alias`, `person_reference` (embeddings only, biometric: readable by owners/editors and the person themselves, no API write path), `face_rejection` (a rejected suggestion never returns), `person.recognition_opt_out`, `person.qualifier` (unique with the name), `face_cluster.model_version`. Cross-library links are blocked by the policies. Tests: `tests/test_people_schema.py`.
+- [x] `app/services/people.py`: `match_face` (auto vs suggest tiers; reports the runner-up so the margin rule can be added), `cluster_faces` (centroid plus a every-member distance cap so look-alikes cannot chain people together), `assign_library_faces` (auto labels are recomputed, ground truth never touched, opt-outs and rejections honored, suggestions never stored) and `recluster_library` (named clusters are never rebuilt). Tests: `tests/test_people.py`.
+- [x] `recluster_people` job (`app/services/pipeline.py`): queued 30 s after a photo's faces are found and 5 s after any edit, one per library (a burst of uploads or edits becomes one run); loops if faces arrive mid-run.
+- [ ] **Open design question (decided with the owner, to brainstorm before building): margin rule.** Auto-label up to a looser distance only when the best person is clearly closer than the runner-up (for example by 0.10), to be tested on the full evaluation set. **Constraint: labeling is never pushed.** Suggestions appear only when someone opens the "Who is this?" page; no notifications, banners, or prompts asking people to label.
+- [x] People endpoints, `app/api/people.py` (tests: `tests/test_people_api.py`): list/create/update/delete people; merge (refuses if the duplicate is linked to an account or has enrolled selfies); `GET /groups` (unnamed groups, largest first, with an on-demand suggestion; editors only; read-only, stores and queues nothing); name a group (existing or new person); label a face (`manual`, or `suggestion` = confirmed); reject a face for a person (remembered). Every change needs owner/editor, checked in the endpoint and again by Row Level Security.
+- [ ] Delete a person's data on opt-out (4c).
+- [x] Aliases: add/remove endpoints (the same nickname may belong to two people on purpose; search disambiguates).
+- [ ] Alias/name resolution shared with search (Phase 5).
+- [ ] Thin "Who is this?" page: groups largest first, merge, suggestions to confirm, nicknames.
 - [ ] Self-enrollment: recognition consent, selfie quality checks, claim-yourself endpoint, owner/editor approval when claiming an already-labeled person, backfill-match job.
 - [ ] Guardian enrollment for a child's person; opt-out and data deletion.
 - [ ] "Is this you?" suggestion inbox for the enrolled person.
-- [ ] `scripts/eval_faces.py` and first committed eval report.
-
-- [ ] Contract: rename `face.face_embedding` to `embedding`; drop `face.album_id` and `photo.album_id` (replaced by `album_photo`).
+- [ ] Age robustness test: dated solo photos of the same person across years (gustavo, natalie) once faces are labeled.
 
 **Done when:** on the labeled folders the eval reports precision ≥ 0.95 at the chosen thresholds, and thresholds in `config.py` cite that report; a member who enrolls selfies is matched in the library's photos without anyone labeling them; opting out removes their references and labels and stops all future matches.
 
@@ -502,6 +526,7 @@ Implemented as the **expand** half of an expand/contract migration: new structur
 - [ ] Single `GET /search` per section 6.3 with keyset pagination and signed thumbnail URLs.
 - [ ] Age-window matching (6.2).
 - [ ] Name search through aliases, with disambiguation when a name matches several people.
+- [ ] Date filters (`from`, `to`) and any "on this day" logic compare the LOCAL wall-clock date (`taken_local`: the stored instant shifted by the camera's recorded UTC offset, as the photos API already returns), never the UTC date. A 8:37 pm photo in UTC-5 belongs to that evening's date, not the next day's.
 - [ ] Delete `search_face.py`, `search_faces_in_db.py`, and the old `/search` router.
 
 **Done when:** "person X, from A to B" returns only photos dated in range, with bbox and match kind, and p95 latency is under 500 ms on a 20k-photo library.
