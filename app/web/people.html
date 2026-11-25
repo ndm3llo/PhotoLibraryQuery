@@ -1,0 +1,458 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>People</title>
+<style>
+  :root { color-scheme: light dark; --fg:#1d1d1f; --bg:#fafafa; --card:#fff; --muted:#6b6b70; --line:#d9d9de; --accent:#2f5bea; --ok:#2e7d32; --bad:#c62828; }
+  @media (prefers-color-scheme: dark) { :root { --fg:#f2f2f4; --bg:#161618; --card:#1f1f23; --muted:#a0a0a8; --line:#34343a; --accent:#7b9bff; --ok:#6fcf74; --bad:#ff7b72; } }
+  body { margin:0; font:16px/1.5 system-ui, sans-serif; background:var(--bg); color:var(--fg); }
+  main { max-width:48rem; margin:0 auto; padding:1.5rem 1rem 4rem; }
+  h1 { font-size:1.4rem; margin:0 0 .25rem; } h2 { font-size:1.1rem; margin:1.75rem 0 .25rem; }
+  p { margin:.4rem 0; } .muted { color:var(--muted); font-size:.9rem; } .ok { color:var(--ok); } .bad { color:var(--bad); }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:1rem; margin-top:.75rem; }
+  select, input[type=text] { box-sizing:border-box; padding:.5rem; font:inherit; border:1px solid var(--line); border-radius:8px; background:transparent; color:inherit; }
+  input[type=text] { width:100%; }
+  button { font:inherit; padding:.45rem .8rem; border-radius:8px; border:1px solid var(--accent); background:var(--accent); color:#fff; cursor:pointer; }
+  button.quiet { background:transparent; color:var(--accent); }
+  button.danger { background:transparent; color:var(--bad); border-color:var(--bad); }
+  button:disabled { opacity:.5; cursor:default; }
+  [hidden] { display:none !important; }
+  .row { display:flex; gap:.5rem; flex-wrap:wrap; align-items:center; margin-top:.6rem; }
+  .faces { display:flex; gap:.4rem; flex-wrap:wrap; }
+  .face { width:5rem; height:5rem; border-radius:10px; background-color:var(--line); background-repeat:no-repeat; }
+  .suggest { background:color-mix(in srgb, var(--accent) 10%, transparent); border-radius:8px; padding:.5rem .75rem; margin-top:.6rem; }
+  .chip { display:inline-flex; gap:.25rem; align-items:center; border:1px solid var(--line); border-radius:999px; padding:.05rem .6rem; font-size:.9rem; }
+  .chip button { border:0; background:transparent; color:var(--muted); padding:0 .15rem; }
+  .tile { position:relative; display:inline-block; cursor:pointer; }
+  .tile input { position:absolute; top:.25rem; left:.25rem; width:1.1rem; height:1.1rem; }
+  .tile.sel .face { outline:3px solid var(--accent); }
+  .tile small { position:absolute; bottom:.2rem; right:.3rem; background:rgba(0,0,0,.55); color:#fff; border-radius:4px; padding:0 .3rem; font-size:.7rem; }
+  .person { border-top:1px solid var(--line); padding:.7rem 0; } .person:first-child { border-top:0; }
+  .grow { flex:1 1 12rem; }
+  nav a { margin-right:1rem; }
+</style>
+</head>
+<body>
+<main>
+  <nav class="muted"><a href="/upload">Upload</a><a href="/login">Account</a></nav>
+  <h1>People</h1>
+  <p class="muted">Naming people is optional and never required. Nothing here sends you reminders; this page only changes when you open it.</p>
+
+  <div class="card" id="needlogin" hidden><p>You need to sign in first. <a href="/login">Sign in</a></p></div>
+
+  <div id="app" hidden>
+    <div class="row"><label for="library">Group</label><select id="library"></select></div>
+    <p id="status" class="muted" role="status"></p>
+
+    <section id="groups-section" hidden>
+      <h2>Who is this?</h2>
+      <p class="muted">People who show up in several photos appear here. Name a group once and every photo with those faces is labeled. You never have to name everyone.</p>
+      <div id="groups"></div>
+    </section>
+
+    <section>
+      <h2>People in this group</h2>
+      <p class="muted" id="people-hint"></p>
+      <div class="card"><div id="people"></div></div>
+      <div class="card" id="add-person" hidden>
+        <strong>Add a person</strong>
+        <div class="row"><input type="text" id="new-name" class="grow" placeholder="Name" maxlength="100" aria-label="Name">
+          <input type="text" id="new-qual" class="grow" placeholder="Short description, only if the name is taken (for example: cousin)" maxlength="60" aria-label="Short description">
+          <button id="add-go">Add</button></div>
+      </div>
+    </section>
+  </div>
+</main>
+
+<script>
+(function () {
+  "use strict";
+  var $ = function (id) { return document.getElementById(id); };
+  var token = null, canEdit = false, people = [];
+
+  var SESSION = "album-session", cfg = null;
+  function session() { try { return JSON.parse(localStorage.getItem(SESSION)); } catch (e) { return null; } }
+
+  // Sign-in tokens last about an hour. Renew quietly with the refresh token (same as the login page) instead of
+  // making people sign in again. Returns true if there is now a usable token.
+  async function renew() {
+    var s = session();
+    if (!s || !s.refresh_token) return false;
+    try {
+      if (!cfg) cfg = await (await fetch("/api/config")).json();
+      var r = await fetch(cfg.supabase_url + "/auth/v1/token?grant_type=refresh_token", {
+        method: "POST", headers: { "apikey": cfg.supabase_anon_key, "Content-Type": "application/json" },
+        body: JSON.stringify({ refresh_token: s.refresh_token }) });
+      if (!r.ok) return false;
+      var p = await r.json();
+      localStorage.setItem(SESSION, JSON.stringify({ access_token: p.access_token, refresh_token: p.refresh_token,
+        expires_at: Math.floor(Date.now() / 1000) + (parseInt(p.expires_in, 10) || 3600) }));
+      token = p.access_token;
+      return true;
+    } catch (e) { return false; }
+  }
+
+  function el(tag, props, kids) {
+    var n = document.createElement(tag);
+    Object.keys(props || {}).forEach(function (k) {
+      if (k === "class") n.className = props[k];
+      else if (k.slice(0, 2) === "on") n.addEventListener(k.slice(2), props[k]);
+      else n.setAttribute(k, props[k]);
+    });
+    (kids || []).forEach(function (c) { n.append(c.nodeType ? c : document.createTextNode(c)); });
+    return n;
+  }
+
+  // Returns {ok, status, data}. `detail` may be a string or a list of validation problems.
+  async function call(method, path, body, retried) {
+    var opts = { method: method, headers: { "Authorization": "Bearer " + token } };
+    if (body !== undefined) { opts.headers["Content-Type"] = "application/json"; opts.body = JSON.stringify(body); }
+    var r = await fetch(path, opts), data = null;
+    if (r.status === 401 && !retried && await renew()) return call(method, path, body, true);
+    try { data = await r.json(); } catch (e) { /* 204 or empty */ }
+    var msg = null;
+    if (!r.ok) {
+      var d = data && data.detail;
+      msg = typeof d === "string" ? d : Array.isArray(d) ? d.map(function (x) { return x.msg; }).join("; ") : "Something went wrong (" + r.status + ")";
+    }
+    return { ok: r.ok, status: r.status, data: data, error: msg };
+  }
+
+  function say(text, kind) { $("status").textContent = text || ""; $("status").className = kind || "muted"; }
+  function label(p) { return p.display_name + (p.qualifier ? ", " + p.qualifier : ""); }
+  function lib() { return $("library").value; }
+  function q(extra) { return "library_id=" + encodeURIComponent(lib()) + (extra ? "&" + extra : ""); }
+
+  // Show just the face from a photo's thumbnail. bbox is in ORIGINAL pixels, as are width/height.
+  function faceCrop(f) {
+    var box = el("div", { class: "face", role: "img", "aria-label": "A face from a photo" });
+    if (!f.thumbnail_url) return box;
+    box.style.backgroundImage = "url(\"" + f.thumbnail_url + "\")";
+    var W = f.photo_width, H = f.photo_height, b = f.bbox;
+    if (!W || !H || !b || b.length < 4) { box.style.backgroundSize = "cover"; return box; }
+    var bw = b[2] - b[0], bh = b[3] - b[1];
+    var side = Math.min(Math.max(bw, bh) * 1.7, W, H);
+    var x0 = Math.min(Math.max(0, (b[0] + b[2]) / 2 - side / 2), W - side);
+    var y0 = Math.min(Math.max(0, (b[1] + b[3]) / 2 - side / 2), H - side);
+    box.style.backgroundSize = (W / side * 100) + "% " + (H / side * 100) + "%";
+    box.style.backgroundPosition = (W > side ? x0 / (W - side) * 100 : 0) + "% " + (H > side ? y0 / (H - side) * 100 : 0) + "%";
+    return box;
+  }
+
+  // ----------------------------------------------------------------- name box with type-ahead
+  var seq = 0;
+  function nameBox(placeholder) {
+    var id = "dl" + (++seq), options = {}, timer = null;
+    var input = el("input", { type: "text", list: id, placeholder: placeholder, maxlength: "100", "aria-label": "Name", autocomplete: "off" });
+    var dl = el("datalist", { id: id });
+    input.addEventListener("input", function () {
+      clearTimeout(timer);
+      var text = input.value.trim();
+      if (!text) { dl.textContent = ""; options = {}; return; }
+      timer = setTimeout(async function () {
+        var r = await call("GET", "/api/people/lookup?" + q("q=" + encodeURIComponent(text)));
+        if (!r.ok || input.value.trim() !== text) return;
+        options = {}; dl.textContent = "";
+        r.data.forEach(function (p) {
+          var l = label(p) + (p.via_alias ? " (" + p.via_alias + ")" : "");
+          options[l] = p; dl.appendChild(el("option", { value: l }));
+        });
+      }, 150);
+    });
+    return { input: input, list: dl, picked: function () { return options[input.value]; } };
+  }
+
+  // ------------------------------------------------------------------------------- groups
+  // <decide>
+  // What "Save name" does for a group. Pure, so it can be tested without a browser (tests/test_people_page.py).
+  //   picked     the person chosen from the type-ahead list, or null
+  //   typed      the text in the name box
+  //   qualifier  the text in the qualifier box ("cousin"); non-empty always means "a different person"
+  //   plain      an existing person whose plain name equals `typed` (found by lookup), or null
+  function decideSave(picked, typed, qualifier, plain) {
+    typed = (typed || "").trim(); qualifier = (qualifier || "").trim();
+    if (!picked && !typed) return { action: "need-name" };
+    if (qualifier) return { action: "create", name: picked ? picked.display_name : typed, qualifier: qualifier };
+    if (picked && (picked.qualifier || picked.via_alias)) return { action: "join", person: picked };
+    var existing = picked || plain;
+    if (existing) return { action: "ask", existing: existing };
+    return { action: "create", name: typed };
+  }
+  // </decide>
+
+  function groupCard(g) {
+    var card = el("div", { class: "card" });
+    card.append(el("div", { class: "faces" }, g.faces.map(faceCrop)));
+    card.append(el("p", { class: "muted" }, ["Seen in " + g.photos + (g.photos === 1 ? " photo" : " photos")]));
+
+    var msg = el("p", { class: "bad", role: "alert" });
+    async function name(body) {
+      var r = await call("POST", "/api/people/groups/" + g.id + "/name", body);
+      if (r.status === 404 && /group not found/i.test(r.error || "")) { say("That group changed while you were looking. The list was refreshed.", "muted"); loadGroups(); return false; }
+      if (!r.ok) { msg.className = "bad"; msg.textContent = r.error; qual.hidden = r.status !== 409; return false; }
+      card.remove(); say("Named " + r.data.faces_named + " face(s).", "ok"); loadPeople(); return true;
+    }
+
+    if (g.suggestion) {
+      var s = g.suggestion;
+      card.append(el("div", { class: "suggest" }, [
+        "Looks like ", el("strong", {}, [s.display_name || "someone"]), "? ",
+        el("div", { class: "row" }, [
+          el("button", { onclick: function () { name({ person_id: s.person_id }); } }, ["Yes, that's them"]),
+          el("button", { class: "quiet", onclick: async function () {
+            var r = await call("POST", "/api/people/groups/" + g.id + "/reject", { person_id: s.person_id });
+            if (r.ok) { card.querySelector(".suggest").remove(); }
+            else if (r.status === 404) { say("That group changed while you were looking. The list was refreshed.", "muted"); loadGroups(); }
+            else msg.textContent = r.error;
+          } }, ["No, that's not them"])])]));
+    }
+
+    var box = nameBox("Who is this? Start typing a name");
+    var qual = el("input", { type: "text", placeholder: "Short description to tell them apart (for example: cousin)", maxlength: "60", "aria-label": "Short description" });
+    qual.hidden = true;
+    card.append(el("div", { class: "row" }, [box.input, box.list]));
+    var hint = el("p", { class: "muted" }, ["Pick a name from the list to use someone who is already here. Anything else creates a new person."]);
+    card.append(hint);
+    card.append(el("div", { class: "row" }, [qual]));
+    card.append(msg);
+    var ask = el("div", { class: "suggest" }); ask.hidden = true;
+    card.append(ask);
+    var saveRow = el("div", { class: "row" });
+    card.append(saveRow);
+    saveRow.append(el("button", { onclick: async function () {
+      msg.textContent = ""; ask.hidden = true; ask.textContent = ""; hint.hidden = false;
+      var picked = box.picked(), typed = box.input.value.trim(), qualifier = qual.value.trim(), plain = null;
+      if (!picked && typed && !qualifier) {
+        var r = await call("GET", "/api/people/lookup?" + q("q=" + encodeURIComponent(typed)));
+        plain = r.ok ? (r.data.filter(function (p) { return !p.qualifier && p.display_name.toLowerCase() === typed.toLowerCase(); })[0] || null) : null;
+      }
+      var d = decideSave(picked, typed, qualifier, plain);
+      if (d.action === "need-name") { msg.textContent = "Type a name first."; return; }
+      if (d.action === "join") return name({ person_id: d.person.id });
+      if (d.action === "create") { var body = { new_name: d.name }; if (d.qualifier) body.qualifier = d.qualifier; return name(body); }
+      // d.action === "ask": never silently join an existing person; show both and let the user decide.
+      var existing = d.existing;
+      ask.hidden = false; saveRow.hidden = true; hint.hidden = true;
+      var shown = el("div", { class: "faces" }, g.faces.slice(0, 4).map(faceCrop)), known = el("div", { class: "faces" });
+      call("GET", "/api/people/" + existing.id + "/faces?best=true&limit=4").then(function (fr) {
+        if (fr.ok) fr.data.faces.forEach(function (f) { known.append(faceCrop(f)); });
+      });
+      ask.append(
+        el("p", {}, ["You typed ", el("strong", {}, ["\u201c" + existing.display_name + "\u201d"]), ". Someone with that name is already in your group."]),
+        el("p", { class: "muted" }, ["The faces you are naming now:"]), shown,
+        el("p", { class: "muted" }, ["The existing " + existing.display_name + ":"]), known,
+        el("p", {}, [el("strong", {}, ["Are these the same person?"])]),
+        el("div", { class: "row" }, [
+          el("button", { onclick: function () { name({ person_id: existing.id }); } }, ["Yes, same person"]),
+          el("button", { class: "quiet", onclick: function () {
+            ask.hidden = true; saveRow.hidden = false; hint.hidden = false; qual.hidden = false; qual.focus();
+            msg.className = "muted"; msg.textContent = "Add something to tell them apart (for example: cousin, or blonde), then press Save name.";
+          } }, ["No, a different person"])]));
+    } }, ["Save name"]));
+    return card;
+  }
+
+  var showAll = false;
+  async function loadGroups() {
+    $("groups").textContent = "";
+    var r = await call("GET", "/api/people/groups?" + q(showAll ? "min_photos=1" : ""));
+    if (!r.ok) { $("groups").append(el("p", { class: "bad" }, [r.error])); return; }
+    r.data.groups.forEach(function (g) { $("groups").appendChild(groupCard(g)); });
+    if (!r.data.groups.length) {
+      $("groups").append(el("p", { class: "muted" }, [r.data.hidden
+        ? "Nobody new shows up often enough to need a name."
+        : "No unnamed faces right now."]));
+    }
+    // Nobody has to name everyone. Faces seen in only a few photos stay quietly unnamed; they appear above on
+    // their own if they show up more.
+    if (r.data.hidden && !showAll) {
+      $("groups").append(el("p", { class: "muted" }, [r.data.hidden + (r.data.hidden === 1 ? " face" : " faces") +
+        " seen in only a few photos " + (r.data.hidden === 1 ? "is" : "are") + " hidden. You do not need to name them; they will appear here if they show up more. "]),
+        el("button", { class: "quiet", onclick: function () { showAll = true; loadGroups(); } }, ["Show them anyway"]));
+    } else if (showAll) {
+      $("groups").append(el("button", { class: "quiet", onclick: function () { showAll = false; loadGroups(); } }, ["Only show people who appear often"]));
+    }
+  }
+
+  // ------------------------------------------------------- a person's faces: review and correct mistakes
+  function facesPanel(p) {
+    var panel = el("div", { class: "card" }), grid = el("div", { class: "faces" }), selected = new Set();
+    var info = el("p", { class: "muted" }), msg = el("p", { class: "bad", role: "alert" });
+    var more = el("button", { class: "quiet" }, ["Show more"]), offset = 0;
+    var actions = el("div", { class: "row" }); actions.hidden = true;
+
+    function refreshActions() { actions.hidden = !canEdit || selected.size === 0; count.textContent = selected.size + " selected"; }
+    var count = el("span", { class: "muted" });
+
+    function addTile(f) {
+      var tile = el("label", { class: "tile" });
+      tile.append(faceCrop(f));
+      if (f.source === "auto") tile.append(el("small", {}, ["auto"]));
+      if (canEdit) {
+        var cb = el("input", { type: "checkbox", "aria-label": "Select this face" });
+        cb.addEventListener("change", function () {
+          if (cb.checked) selected.add(f.id); else selected.delete(f.id);
+          tile.classList.toggle("sel", cb.checked); refreshActions();
+        });
+        tile.append(cb);
+      }
+      grid.append(tile);
+    }
+
+    async function load() {
+      var r = await call("GET", "/api/people/" + p.id + "/faces?limit=60&offset=" + offset);
+      if (!r.ok) { msg.textContent = r.error; return; }
+      r.data.faces.forEach(addTile); offset += r.data.faces.length;
+      more.hidden = offset >= r.data.total;
+      info.textContent = r.data.total + (r.data.total === 1 ? " face" : " faces") + ". Faces marked \"auto\" were labeled by the app, least certain first; check those." +
+        (canEdit ? " Tick any that are not " + p.display_name + "." : "");
+    }
+    more.addEventListener("click", load);
+
+    if (canEdit) {
+      var others = people.filter(function (o) { return o.id !== p.id; });
+      var target = el("select", { "aria-label": "Move selected faces to" }, [el("option", { value: "" }, ["Move to\u2026"]),
+        el("option", { value: "__new" }, ["A new person\u2026"])].concat(others.map(function (o) { return el("option", { value: o.id }, [label(o)]); })));
+      var newName = el("input", { type: "text", placeholder: "Name", maxlength: "100", "aria-label": "New person's name" });
+      var newQual = el("input", { type: "text", placeholder: "Short description, if the name is taken", maxlength: "60", "aria-label": "New person's short description" });
+      newName.hidden = newQual.hidden = true;
+      target.addEventListener("change", function () { newName.hidden = newQual.hidden = target.value !== "__new"; });
+
+      function done(text) { say(text, "ok"); loadPeople(); loadGroups(); }
+      actions.append(count,
+        el("button", { class: "danger", onclick: async function () {
+          msg.textContent = "";
+          if (!confirm("Remove " + selected.size + " face(s) from " + label(p) + "? They become unnamed and will not be suggested for " + p.display_name + " again.")) return;
+          var r = await call("POST", "/api/people/" + p.id + "/faces/remove", { face_ids: Array.from(selected) });
+          if (r.ok) done("Removed " + r.data.removed + " face(s) from " + p.display_name + "."); else msg.textContent = r.error;
+        } }, ["Not " + p.display_name]),
+        target, newName, newQual,
+        el("button", { class: "quiet", onclick: async function () {
+          msg.textContent = "";
+          if (!target.value) { msg.textContent = "Choose who to move them to."; return; }
+          var to = target.value;
+          if (to === "__new") {
+            var body = { library_id: lib(), display_name: newName.value.trim() };
+            if (!body.display_name) { msg.textContent = "Type the new person's name."; return; }
+            if (newQual.value.trim()) body.qualifier = newQual.value.trim();
+            var c = await call("POST", "/api/people", body);
+            if (!c.ok) { msg.textContent = c.error; return; }
+            to = c.data.id;
+          }
+          var r = await call("POST", "/api/people/" + p.id + "/faces/move", { face_ids: Array.from(selected), to_person_id: to });
+          if (r.ok) done("Moved " + r.data.moved + " face(s)."); else msg.textContent = r.error;
+        } }, ["Move"]));
+    }
+    panel.append(info, grid, el("div", { class: "row" }, [more]), actions, msg);
+    load();
+    return panel;
+  }
+
+  // ------------------------------------------------------------------------------- people
+  function personRow(p) {
+    var row = el("div", { class: "person" });
+    row.append(el("div", {}, [el("strong", {}, [p.display_name]), p.qualifier ? " " : "", p.qualifier ? el("span", { class: "muted" }, [p.qualifier]) : "",
+                              el("span", { class: "muted" }, ["  " + p.faces + (p.faces === 1 ? " face" : " faces")])]));
+    var chips = el("div", { class: "row" });
+    var err = el("p", { class: "bad", role: "alert" });
+    p.alias_items.forEach(function (a) {
+      var chip = el("span", { class: "chip" }, [a.alias]);
+      if (canEdit) chip.append(el("button", { "aria-label": "Remove nickname " + a.alias, title: "Remove", onclick: async function () {
+        var r = await call("DELETE", "/api/people/" + p.id + "/aliases/" + a.id);
+        if (r.ok) loadPeople(); else err.textContent = r.error;
+      } }, ["\u00d7"]));
+      chips.append(chip);
+    });
+    row.append(chips);
+    var holder = el("div"), open = false;
+    row.append(el("div", { class: "row" }, [el("button", { class: "quiet", onclick: function (ev) {
+      open = !open; holder.textContent = ""; ev.target.textContent = open ? "Hide faces" : "Faces";
+      if (open) holder.append(facesPanel(p));
+    } }, ["Faces"])]), holder);
+    if (!canEdit) return row;
+
+    var nick = el("input", { type: "text", placeholder: "Add a nickname", maxlength: "100", "aria-label": "Nickname for " + p.display_name });
+    var tools = el("div", { class: "row" }, [
+      el("div", { class: "grow" }, [nick]),
+      el("button", { class: "quiet", onclick: async function () {
+        if (!nick.value.trim()) return;
+        var r = await call("POST", "/api/people/" + p.id + "/aliases", { alias: nick.value });
+        if (r.ok) loadPeople(); else err.textContent = r.error;
+      } }, ["Add nickname"]),
+      el("button", { class: "quiet", onclick: async function () {
+        var n = prompt("Name", p.display_name); if (n === null) return;
+        var ql = prompt("Short description, to tell people with the same name apart (leave empty for none)", p.qualifier || ""); if (ql === null) return;
+        var body = { display_name: n }; if (ql.trim()) body.qualifier = ql;
+        var r = await call("PATCH", "/api/people/" + p.id, body);
+        if (r.ok) loadPeople(); else err.textContent = r.error;
+      } }, ["Rename"]),
+      el("button", { class: "quiet", onclick: async function () {
+        var others = people.filter(function (o) { return o.id !== p.id; });
+        if (!others.length) { err.textContent = "There is no one else to merge with."; return; }
+        var pick = prompt("Merge " + label(p) + " into which person? Type the number:\n" +
+          others.map(function (o, i) { return (i + 1) + ". " + label(o); }).join("\n"));
+        var target = others[parseInt(pick, 10) - 1]; if (!target) return;
+        if (!confirm("Merge " + label(p) + " into " + label(target) + "? Their faces move to " + label(target) + ".")) return;
+        var r = await call("POST", "/api/people/" + p.id + "/merge", { into_id: target.id });
+        if (r.ok) loadPeople(); else err.textContent = r.error;
+      } }, ["Merge"]),
+      el("button", { class: "danger", onclick: async function () {
+        if (!confirm("Delete " + label(p) + "? Their faces stay in the photos, unlabeled.")) return;
+        var r = await call("DELETE", "/api/people/" + p.id);
+        if (r.ok) { loadPeople(); loadGroups(); } else err.textContent = r.error;
+      } }, ["Delete"])]);
+    row.append(tools, err);
+    return row;
+  }
+
+  async function loadPeople() {
+    var r = await call("GET", "/api/people?" + q());
+    $("people").textContent = "";
+    if (!r.ok) { $("people").append(el("p", { class: "bad" }, [r.error])); return; }
+    people = r.data;
+    $("people-hint").textContent = people.length
+      ? "Use these exact names when naming faces, so nobody ends up under two spellings."
+      : "No one has been named yet.";
+    people.forEach(function (p) { $("people").appendChild(personRow(p)); });
+  }
+
+  async function addPerson() {
+    var name = $("new-name").value.trim(), qual = $("new-qual").value.trim();
+    if (!name) { say("Type a name first.", "bad"); return; }
+    var body = { library_id: lib(), display_name: name }; if (qual) body.qualifier = qual;
+    var r = await call("POST", "/api/people", body);
+    if (!r.ok) { say(r.error, "bad"); return; }
+    $("new-name").value = ""; $("new-qual").value = ""; say("Added " + name + ".", "ok"); loadPeople();
+  }
+
+  async function loadLibrary() {
+    var role = $("library").selectedOptions[0].dataset.role;
+    canEdit = role !== "viewer";
+    $("groups-section").hidden = !canEdit; $("add-person").hidden = !canEdit;
+    say("");
+    await loadPeople();
+    if (canEdit) await loadGroups();
+  }
+
+  (async function () {
+    var s = session();
+    if (s && s.expires_at - 60 < Date.now() / 1000) await renew();
+    s = session();
+    if (!s || !s.access_token || s.expires_at < Date.now() / 1000) { $("needlogin").hidden = false; return; }
+    token = s.access_token;
+    var me = await call("GET", "/api/me");
+    if (!me.ok || !me.data.libraries.length) { $("needlogin").hidden = false; return; }
+    me.data.libraries.forEach(function (l) {
+      var o = el("option", { value: l.id }, [l.name + " (" + l.role + ")"]); o.dataset.role = l.role; $("library").appendChild(o);
+    });
+    $("app").hidden = false;
+    $("library").addEventListener("change", loadLibrary);
+    $("add-go").addEventListener("click", addPerson);
+    loadLibrary();
+  })();
+})();
+</script>
+</body>
+</html>

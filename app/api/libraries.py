@@ -1,7 +1,7 @@
 """Libraries, members, and invites.
 
-Roles: owner (manages members, invites, library settings), editor (uploads, labels people),
-viewer (read-only). A library always keeps at least one owner (enforced by a database trigger).
+Roles: owner (manages members, invites, library settings), editor (uploads, labels people; the default
+for an invite), viewer (read-only). A library always keeps at least one owner (enforced by a database trigger).
 Authorization is enforced twice: explicit checks here for clear errors, and Row Level Security
 in the database as the backstop.
 """
@@ -40,7 +40,7 @@ class RoleChange(BaseModel):
 
 class InviteCreate(BaseModel):
     email: str = Field(max_length=254)
-    role: Role = "viewer"
+    role: Role = "editor"  # families share and name photos together; owners can pick viewer for a guest
 
     @field_validator("email")
     @classmethod

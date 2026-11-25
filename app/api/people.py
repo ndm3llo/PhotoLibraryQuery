@@ -20,6 +20,7 @@ from sqlmodel import Session
 
 from app.auth.deps import current_user, get_rls_session, require_role, resolve_library
 from app.auth.jwt import AuthUser
+from app.config import FACE_GROUP_MIN_PHOTOS
 from app.db.audit import audit
 from app.db.rls import service_session
 from app.services import faces as face_engine
@@ -91,6 +92,14 @@ class Merge(BaseModel):
     into_id: UUID
 
 
+class FaceIds(BaseModel):
+    face_ids: list[UUID] = Field(min_length=1, max_length=200)
+
+
+class FaceMove(FaceIds):
+    to_person_id: UUID
+
+
 # ----------------------------------------------------------------------------------- helpers
 
 def _queue_recluster(library_id: UUID, delay: int = RECLUSTER_DELAY_SECONDS) -> None:
@@ -122,7 +131,7 @@ def _face(session: Session, face_id: UUID):
 
 def _same_name() -> HTTPException:
     return HTTPException(status_code=409, detail="Someone with that name already exists in this group. "
-                         "Add a qualifier to tell them apart, for example \"cousin\".")
+                         "Add a short description to tell them apart, for example \"cousin\".")
 
 
 def _ip(request: Request) -> str | None:
@@ -138,11 +147,12 @@ def list_people(library_id: UUID | None = Query(None), user: AuthUser = Depends(
     rows = session.execute(text("""
         SELECT p.id, p.display_name, p.qualifier, p.birth_date, p.death_date, p.recognition_opt_out,
                (SELECT count(*) FROM face f WHERE f.person_id = p.id) AS faces,
-               COALESCE((SELECT array_agg(a.alias ORDER BY lower(a.alias)) FROM person_alias a
-                          WHERE a.person_id = p.id), '{}') AS aliases
+               COALESCE((SELECT json_agg(json_build_object('id', a.id, 'alias', a.alias) ORDER BY lower(a.alias))
+                           FROM person_alias a WHERE a.person_id = p.id), '[]'::json) AS alias_items
           FROM person p WHERE p.library_id = :l ORDER BY lower(p.display_name)"""), {"l": lib}).all()
     return [{"id": r.id, "display_name": r.display_name, "qualifier": r.qualifier, "birth_date": r.birth_date, "death_date": r.death_date,
-             "recognition_opt_out": r.recognition_opt_out, "faces": r.faces, "aliases": list(r.aliases)} for r in rows]
+             "recognition_opt_out": r.recognition_opt_out, "faces": r.faces,
+             "aliases": [a["alias"] for a in r.alias_items], "alias_items": r.alias_items} for r in rows]
 
 
 @router.get("/lookup")
@@ -248,6 +258,76 @@ def merge_person(person_id: UUID, body: Merge, request: Request, user: AuthUser 
     return {"id": dst.id}
 
 
+# ------------------------------------------------------- review and correct a person's faces
+
+@router.get("/{person_id}/faces")
+def person_faces(person_id: UUID, limit: int = Query(60, ge=1, le=200), offset: int = Query(0, ge=0),
+                 best: bool = Query(False), user: AuthUser = Depends(current_user), session: Session = Depends(get_rls_session)):
+    """The faces labeled as this person. By default for REVIEW: automatic labels first, least confident first (the
+    likeliest mistakes), then labels a person made. With best=true for SHOWING who someone is: labels a person made
+    first, then the clearest faces."""
+    _person(session, person_id)
+    total = session.execute(text("SELECT count(*) FROM face WHERE person_id = :p"), {"p": person_id}).scalar()
+    rows = session.execute(text("""
+        SELECT f.id, f.photo_id, f.bbox, f.person_source, f.person_confidence, p.width, p.height, p.thumb_key
+          FROM face f JOIN photo p ON p.id = f.photo_id WHERE f.person_id = :p
+         ORDER BY """ + ("(f.person_source = 'auto') ASC, f.quality DESC NULLS LAST, f.id" if best else
+                         "(f.person_source = 'auto') DESC, f.person_confidence ASC NULLS LAST, f.id") + """
+         LIMIT :n OFFSET :o"""), {"p": person_id, "n": limit, "o": offset}).all()
+    storage = get_storage()
+    return {"total": total, "faces": [
+        {"id": r.id, "photo_id": r.photo_id, "bbox": r.bbox, "source": r.person_source,
+         "confidence": r.person_confidence, "photo_width": r.width, "photo_height": r.height,
+         "thumbnail_url": storage.presign_get(r.thumb_key) if r.thumb_key else None} for r in rows]}
+
+
+@router.post("/{person_id}/faces/remove")
+def remove_faces(person_id: UUID, body: FaceIds, user: AuthUser = Depends(current_user),
+                 session: Session = Depends(get_rls_session)):
+    """'These faces are not this person.' They become unlabeled, and this person is remembered as rejected for
+    each, so it is never suggested or applied automatically again. Faces that are not theirs are ignored."""
+    person = _editable_person(session, user, person_id)
+    found = [r[0] for r in session.execute(text("SELECT id FROM face WHERE id = ANY(:ids) AND person_id = :p"),
+                                           {"ids": body.face_ids, "p": person_id})]
+    if found:
+        session.execute(text("""INSERT INTO face_rejection (face_id, person_id, library_id, rejected_by)
+                                SELECT f.id, :p, f.library_id, :u FROM face f WHERE f.id = ANY(:ids)
+                                ON CONFLICT DO NOTHING"""), {"p": person_id, "u": user.id, "ids": found})
+        session.execute(text("UPDATE face SET person_id = NULL, person_source = NULL, person_confidence = NULL "
+                             "WHERE id = ANY(:ids)"), {"ids": found})
+    session.commit()
+    if found:
+        _queue_recluster(person.library_id)
+    return {"removed": len(found)}
+
+
+@router.post("/{person_id}/faces/move")
+def move_faces(person_id: UUID, body: FaceMove, user: AuthUser = Depends(current_user),
+               session: Session = Depends(get_rls_session)):
+    """'These faces are someone else': move them to another person (a decision by a person, so ground truth).
+    The old person is remembered as rejected for each. Faces that are not theirs are ignored."""
+    src = _editable_person(session, user, person_id)
+    dst = _person(session, body.to_person_id)
+    if dst.library_id != src.library_id or dst.id == src.id:
+        raise HTTPException(status_code=404 if dst.library_id != src.library_id else 422,
+                            detail="Person not found" if dst.library_id != src.library_id
+                            else "Choose a different person to move the faces to")
+    found = [r[0] for r in session.execute(text("SELECT id FROM face WHERE id = ANY(:ids) AND person_id = :p"),
+                                           {"ids": body.face_ids, "p": person_id})]
+    if found:
+        session.execute(text("""INSERT INTO face_rejection (face_id, person_id, library_id, rejected_by)
+                                SELECT f.id, :p, f.library_id, :u FROM face f WHERE f.id = ANY(:ids)
+                                ON CONFLICT DO NOTHING"""), {"p": person_id, "u": user.id, "ids": found})
+        session.execute(text("DELETE FROM face_rejection WHERE person_id = :d AND face_id = ANY(:ids)"),
+                        {"d": dst.id, "ids": found})
+        session.execute(text("UPDATE face SET person_id = :d, person_source = 'manual', person_confidence = NULL "
+                             "WHERE id = ANY(:ids)"), {"d": dst.id, "ids": found})
+    session.commit()
+    if found:
+        _queue_recluster(src.library_id)
+    return {"moved": len(found)}
+
+
 # -------------------------------------------------------------------------------- nicknames
 
 @router.post("/{person_id}/aliases", status_code=201)
@@ -283,17 +363,23 @@ def remove_alias(person_id: UUID, alias_id: UUID, user: AuthUser = Depends(curre
 
 @router.get("/groups")
 def list_groups(library_id: UUID | None = Query(None), limit: int = Query(30, ge=1, le=100),
+                min_photos: int = Query(FACE_GROUP_MIN_PHOTOS, ge=1, le=1000),
                 user: AuthUser = Depends(current_user), session: Session = Depends(get_rls_session)):
-    """Groups of faces nobody has named yet, largest first, each with a few sample faces and (when there is
-    one) a suggested person. Suggestions exist only in this response; nothing is stored or pushed."""
+    """Groups of faces nobody has named yet that show up REPEATEDLY (in at least `min_photos` different photos),
+    largest first, each with a few sample faces and (when there is one) a suggested person. Rarer faces are not
+    listed, only counted in `hidden`: nobody has to name everyone. Suggestions exist only in this response;
+    nothing is stored or pushed."""
     lib = resolve_library(session, user.id, library_id, EDIT)
     model = face_engine.MODEL_VERSION
-    clusters = session.execute(text("""
-        SELECT c.id, count(*) AS size FROM face_cluster c JOIN face f ON f.cluster_id = c.id
+    all_groups = session.execute(text("""
+        SELECT c.id, count(*) AS size, count(DISTINCT f.photo_id) AS photos
+          FROM face_cluster c JOIN face f ON f.cluster_id = c.id
          WHERE c.library_id = :l AND c.person_id IS NULL AND f.person_id IS NULL AND f.model_version = :m
-         GROUP BY c.id ORDER BY size DESC, c.id LIMIT :n"""), {"l": lib, "m": model, "n": limit}).all()
+         GROUP BY c.id ORDER BY photos DESC, size DESC, c.id"""), {"l": lib, "m": model}).all()
+    clusters = [c for c in all_groups if c.photos >= min_photos][:limit]
+    hidden = sum(1 for c in all_groups if c.photos < min_photos)
     if not clusters:
-        return []
+        return {"groups": [], "hidden": hidden, "min_photos": min_photos}
     ids = [c.id for c in clusters]
     samples = session.execute(text("""
         SELECT * FROM (
@@ -326,11 +412,11 @@ def list_groups(library_id: UUID | None = Query(None), limit: int = Query(30, ge
                 suggestion = {"person_id": m.person_id, "display_name": names.get(m.person_id),
                               "distance": m.distance}
         out.append({
-            "id": c.id, "size": c.size, "suggestion": suggestion,
+            "id": c.id, "size": c.size, "photos": c.photos, "suggestion": suggestion,
             "faces": [{"id": f.id, "photo_id": f.photo_id, "bbox": f.bbox, "photo_width": f.width,
                        "photo_height": f.height,
                        "thumbnail_url": storage.presign_get(f.thumb_key) if f.thumb_key else None} for f in faces]})
-    return out
+    return {"groups": out, "hidden": hidden, "min_photos": min_photos}
 
 
 @router.post("/groups/{cluster_id}/name")
@@ -363,6 +449,24 @@ def name_group(cluster_id: UUID, body: GroupName, request: Request, user: AuthUs
     audit(user.id, "group.name", library_id=cluster.library_id, target=str(pid), meta={"faces": n}, ip=_ip(request))
     _queue_recluster(cluster.library_id)
     return {"person_id": pid, "faces_named": n}
+
+
+@router.post("/groups/{cluster_id}/reject", status_code=204)
+def reject_group(cluster_id: UUID, body: FaceReject, user: AuthUser = Depends(current_user),
+                 session: Session = Depends(get_rls_session)):
+    """'None of these faces is X': remembered for every unnamed face in the group."""
+    cluster = session.execute(text("SELECT id, library_id FROM face_cluster WHERE id = :c"), {"c": cluster_id}).first()
+    if cluster is None:
+        raise HTTPException(status_code=404, detail="Group not found")
+    require_role(session, user.id, cluster.library_id, EDIT)
+    person = _person(session, body.person_id)
+    if person.library_id != cluster.library_id:
+        raise HTTPException(status_code=404, detail="Person not found")
+    session.execute(text("""INSERT INTO face_rejection (face_id, person_id, library_id, rejected_by)
+                            SELECT f.id, :p, f.library_id, :u FROM face f
+                             WHERE f.cluster_id = :c AND f.person_id IS NULL
+                            ON CONFLICT DO NOTHING"""), {"p": person.id, "u": user.id, "c": cluster_id})
+    session.commit()
 
 
 # ----------------------------------------------------------------------- single faces

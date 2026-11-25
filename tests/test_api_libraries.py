@@ -260,3 +260,14 @@ def test_actions_are_audited(ctx):
     with ctx.engine.connect() as conn:
         actions = {r[0] for r in conn.execute(text("SELECT action FROM audit_log WHERE library_id=:l"), {"l": lib})}
     assert {"library.create", "invite.create", "invite.accept"} <= actions
+
+
+def test_an_invite_without_a_role_makes_an_editor_and_a_guest_can_still_be_a_viewer(ctx):
+    owner, relative, guest = User(ctx, "owner"), User(ctx, "relative"), User(ctx, "guest")
+    lib = make_library(owner)
+    for person, body in [(relative, {"email": relative.email}), (guest, {"email": guest.email, "role": "viewer"})]:
+        inv = owner.call("POST", f"/api/libraries/{lib}/invites", json=body)
+        assert inv.status_code == 201, inv.text
+        assert person.call("POST", "/api/invites/accept", json={"token": inv.json()["token"]}).status_code == 200
+    members = {m["profile_id"]: m["role"] for m in owner.call("GET", f"/api/libraries/{lib}/members").json()}
+    assert members[str(relative.id)] == "editor" and members[str(guest.id)] == "viewer"

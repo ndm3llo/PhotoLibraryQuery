@@ -5,6 +5,10 @@ Family-focused photo album that is good at finding photos of specific people at 
 The production design and phased migration plan live in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 Read it before changing anything.
 
+**Picking the project up in a new chat:** read [handoff.md](handoff.md) first (current state, decisions, next steps);
+the rules for keeping it up to date are in [instruction_handoff.md](docs/instruction_handoff.md). Screens and wording:
+[docs/UI_SPEC.md](docs/UI_SPEC.md).
+
 ## Setup
 
 ```bash
@@ -90,6 +94,14 @@ export ALBUM_TOKEN=<copy from /login>
 python scripts/bulk_import.py ~/Pictures/family --library <library-id>
 ```
 
+Before any live migration, snapshot the database and rehearse on a restored local copy:
+
+```bash
+python scripts/backup_db.py --label pre-0009            # writes backups/ (gitignored, owner-only)
+# local DB at the current version, then:
+python scripts/backup_db.py --restore-to $DATABASE_URL backups/<file>.json && alembic upgrade head
+```
+
 Check the real bucket (signed uploads, CORS, public access) any time storage settings change:
 
 ```bash
@@ -104,7 +116,7 @@ have one) and turn off public access on the bucket.
 - `app/`: FastAPI app (api, db, models, services)
 - `migrations/`: Alembic migrations (schema, RLS policies)
 - `docker/`, `docker-compose.yml`: local Postgres
-- `scripts/`: `link_owner.py`, `bulk_import.py`, `check_storage.py`
+- `scripts/`: `link_owner.py`, `bulk_import.py`, `check_storage.py`, `backup_db.py`, `eval_faces.py`
 - `infra/`: Cloudflare R2 CORS policy
 - `tests/`: pytest suite
 - `docs/`: architecture and migration plan

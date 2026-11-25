@@ -32,3 +32,8 @@ INVITE_TTL_DAYS = 7
 FACE_AUTO_MAX = 0.45      # at or below: may be applied automatically (still never counts as confirmed)
 FACE_SUGGEST_MAX = 0.60   # up to here: offered as a suggestion for a person to confirm
 FACE_AUTO_MIN_QUALITY = 0.5  # small or unsure faces are only ever suggestions (quality = det_score * min(1, px/112))
+
+# "Who is this?" only asks about people who show up repeatedly: an unnamed group is offered for naming once its
+# faces appear in at least this many DIFFERENT photos. Rarer faces stay quietly unnamed. Nobody is ever required
+# to name everyone; a group that keeps appearing crosses the line by itself.
+FACE_GROUP_MIN_PHOTOS = 3

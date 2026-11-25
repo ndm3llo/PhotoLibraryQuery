@@ -490,7 +490,8 @@ Implemented as the **expand** half of an expand/contract migration: new structur
 4. **"This is me" is the preferred path** (owner, 2026-11-21): members who enroll selfies are found automatically; owners/editors still name people without accounts (children, elders, the deceased). It is offered once after joining, skippable, never nagged.
 5. **No editor approval for claiming a person.** Any member may claim an unclaimed person; a person can be claimed once; a claim never changes existing labels (selfies only produce correctable automatic matches); claims are audit-logged and the owner can unlink one. If the selfie does not resemble the person's labeled photos the member gets a warning, not a block.
 6. **Open sign-up.** Anyone can sign in, then create a group or join by an emailed invite link (invites stay bound to one email). Needs abuse limits before launch: groups per account, storage quota per group, upload rate limit.
-7. **Same name, two people:** allowed, but the pair (name, `qualifier`) is unique per library (`uq_person_name`), so two Sarahs must be told apart ("Sarah" and "Sarah, cousin"). Enrollment: a name that matches an unclaimed person offers "is this you?" with photos; a claimed one offers a new person with a qualifier; no match creates one. Search asks "which Sarah?" when ambiguous.
+7. **Nobody has to name everyone** (owner, 2026-11-22): "Who is this?" lists only unnamed groups whose faces appear in at least `FACE_GROUP_MIN_PHOTOS` (3) *different photos* (three faces in one photo do not count). Rarer faces are only counted ("N faces seen in only a few photos are hidden"), with a "show them anyway" switch; a group that keeps appearing crosses the line on its own. Pull-only, like everything else here.
+8. **Same name, two people:** allowed, but the pair (name, `qualifier`) is unique per library (`uq_person_name`), so two Sarahs must be told apart ("Sarah" and "Sarah, cousin"). Enrollment: a name that matches an unclaimed person offers "is this you?" with photos; a claimed one offers a new person with a qualifier; no match creates one. Search asks "which Sarah?" when ambiguous.
 
 **4a. Face model (done)**
 
@@ -505,15 +506,17 @@ Implemented as the **expand** half of an expand/contract migration: new structur
 
 **4b to 4e (remaining)**
 
-- [x] Migration `0008` (written and tested, **not yet applied to the live database**): `person_alias`, `person_reference` (embeddings only, biometric: readable by owners/editors and the person themselves, no API write path), `face_rejection` (a rejected suggestion never returns), `person.recognition_opt_out`, `person.qualifier` (unique with the name), `face_cluster.model_version`. Cross-library links are blocked by the policies. Tests: `tests/test_people_schema.py`.
+- [x] Migration `0008` (applied to the live database 2026-11-21 after a backup and a rehearsal on a restored copy: row counts unchanged, downgrade and re-upgrade clean): `person_alias`, `person_reference` (embeddings only, biometric: readable by owners/editors and the person themselves, no API write path), `face_rejection` (a rejected suggestion never returns), `person.recognition_opt_out`, `person.qualifier` (unique with the name), `face_cluster.model_version`. Cross-library links are blocked by the policies. Tests: `tests/test_people_schema.py`.
 - [x] `app/services/people.py`: `match_face` (auto vs suggest tiers; reports the runner-up so the margin rule can be added), `cluster_faces` (centroid plus a every-member distance cap so look-alikes cannot chain people together), `assign_library_faces` (auto labels are recomputed, ground truth never touched, opt-outs and rejections honored, suggestions never stored) and `recluster_library` (named clusters are never rebuilt). Tests: `tests/test_people.py`.
 - [x] `recluster_people` job (`app/services/pipeline.py`): queued 30 s after a photo's faces are found and 5 s after any edit, one per library (a burst of uploads or edits becomes one run); loops if faces arrive mid-run.
 - [ ] **Open design question (decided with the owner, to brainstorm before building): margin rule.** Auto-label up to a looser distance only when the best person is clearly closer than the runner-up (for example by 0.10), to be tested on the full evaluation set. **Constraint: labeling is never pushed.** Suggestions appear only when someone opens the "Who is this?" page; no notifications, banners, or prompts asking people to label.
+  **Amended by the owner 2026-11-25:** a one-time "Who is this?" pop-up for people who appear often is allowed; see
+  [UI_SPEC.md](UI_SPEC.md) ("Help, settings and naming") for its limits.
 - [x] People endpoints, `app/api/people.py` (tests: `tests/test_people_api.py`): list/create/update/delete people; merge (refuses if the duplicate is linked to an account or has enrolled selfies); `GET /groups` (unnamed groups, largest first, with an on-demand suggestion; editors only; read-only, stores and queues nothing); name a group (existing or new person); label a face (`manual`, or `suggestion` = confirmed); reject a face for a person (remembered). Every change needs owner/editor, checked in the endpoint and again by Row Level Security.
 - [ ] Delete a person's data on opt-out (4c).
 - [x] Aliases: add/remove endpoints (the same nickname may belong to two people on purpose; search disambiguates).
 - [ ] Alias/name resolution shared with search (Phase 5).
-- [ ] Thin "Who is this?" page: groups largest first, merge, suggestions to confirm, nicknames.
+- [x] `/people` page (`app/web/people.html`): everyone sees the people list; owners/editors also get the "Who is this?" groups (face crops, suggestion yes/no, type-ahead name box that distinguishes picking an existing person from creating a new one, qualifier prompt on a name clash), nicknames, rename, merge, delete. Pull-only: it never notifies or prompts. Group-level reject: `POST /groups/{id}/reject`. Saving a name that already exists asks "same person?" instead of silently joining them (found in the first real test: a look-alike stranger was merged into Ananya). Group ids are stable across regroups (found in the same test: "Group not found"). Each person has a **Faces** panel to review and correct mistakes: `GET /{id}/faces` (automatic labels first, least confident first), `POST /{id}/faces/remove` (unlabel and remember the rejection), `POST /{id}/faces/move` (to another person, as ground truth); a corrected face is never re-labeled the old way by a regroup. **First real-photo test: 2026-11-22 on a 'Face test' group of 330 photos; two UI bugs found and fixed.**
 - [ ] Self-enrollment: recognition consent, selfie quality checks, claim-yourself endpoint, owner/editor approval when claiming an already-labeled person, backfill-match job.
 - [ ] Guardian enrollment for a child's person; opt-out and data deletion.
 - [ ] "Is this you?" suggestion inbox for the enrolled person.
@@ -522,6 +525,21 @@ Implemented as the **expand** half of an expand/contract migration: new structur
 **Done when:** on the labeled folders the eval reports precision ≥ 0.95 at the chosen thresholds, and thresholds in `config.py` cite that report; a member who enrolls selfies is matched in the library's photos without anyone labeling them; opting out removes their references and labels and stops all future matches.
 
 ### Phase 5: Search
+
+**Phase 5, semantic search (decided 2026-11-23, deferred):** "Preeya with cat" = filter by person and date first, then rank
+the rest by CLIP text-to-image similarity (the vectors already exist: `photo.clip_embedding`, `clip-ViT-B-32`; the
+prototype `/api/search` ranks without a threshold). To do, in order: (1) record which model made each vector
+(`photo.clip_model`, as `photo.faces_model` does for faces); (2) benchmark a newer model (a larger CLIP or SigLIP) on real
+searches such as beach, dog, cake; (3) a re-embedding job (safe while the photos are test data; with real photos, run it in
+the background and keep the old vectors until it finishes); (4) a minimum score and a "Best matches" label so a search with
+no real match is not presented as a result; (5) place: GPS to place names for exact places, CLIP for scenes. Named pets would
+be a separate feature.
+
+**Matching rules for Phase 5 (owner, 2026-11-23):** every name comparison (people, nicknames, short descriptions, search
+text) uses `app.services.people.fold`: capitals, accents and extra spaces are ignored, so "maria" finds "María". Invite
+codes and emails are case-insensitive. **Album filters:** people (together or any), dates (year, range, on this day, no
+date; local dates via `taken_local`), added by; the count of matching photos is shown before applying.
+
 
 - [ ] Single `GET /search` per section 6.3 with keyset pagination and signed thumbnail URLs.
 - [ ] Age-window matching (6.2).

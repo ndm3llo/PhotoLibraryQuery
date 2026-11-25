@@ -39,3 +39,8 @@ def login_page():
 @router.get("/upload", response_class=HTMLResponse, include_in_schema=False)
 def upload_page():
     return HTMLResponse((_WEB / "upload.html").read_text(encoding="utf-8"), headers=_HEADERS)
+
+
+@router.get("/people", response_class=HTMLResponse, include_in_schema=False)
+def people_page():
+    return HTMLResponse((_WEB / "people.html").read_text(encoding="utf-8"), headers=_HEADERS)

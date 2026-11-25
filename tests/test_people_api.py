@@ -143,7 +143,7 @@ def test_nicknames_add_list_delete_and_reject_duplicates_and_blanks(fam):
     assert fam.editor.call("POST", f"/api/people/{pid}/aliases", json={"alias": "   "}).status_code == 422
     assert fam.viewer.call("POST", f"/api/people/{pid}/aliases", json={"alias": "Nana"}).status_code == 403
     me = [p for p in fam.viewer.call("GET", f"/api/people?library_id={fam.lib}").json() if p["id"] == pid][0]
-    assert me["aliases"] == ["Grandma"]
+    assert me["aliases"] == ["Grandma"] and me["alias_items"] == [{"id": r.json()["id"], "alias": "Grandma"}]
     assert fam.viewer.call("DELETE", f"/api/people/{pid}/aliases/{r.json()['id']}").status_code == 403
     assert fam.editor.call("DELETE", f"/api/people/{pid}/aliases/{r.json()['id']}").status_code == 204
     assert fam.editor.call("DELETE", f"/api/people/{pid}/aliases/{r.json()['id']}").status_code == 404
@@ -209,7 +209,7 @@ def test_groups_are_for_editors_largest_first_with_a_suggestion_only_where_there
     ann, likeann, strangers, lone = make_groups(fam)
     assert fam.viewer.call("GET", f"/api/people/groups?library_id={fam.lib}").status_code == 403
     assert fam.outsider.call("GET", f"/api/people/groups?library_id={fam.lib}").status_code == 404
-    groups = fam.editor.call("GET", f"/api/people/groups?library_id={fam.lib}").json()
+    groups = fam.editor.call("GET", f"/api/people/groups?library_id={fam.lib}&min_photos=1").json()["groups"]
     assert [g["size"] for g in groups] == sorted([g["size"] for g in groups], reverse=True)
     assert groups[0]["size"] == 4 and groups[0]["suggestion"] is None
     sug = [g for g in groups if g["suggestion"]]
@@ -360,7 +360,7 @@ def test_enrichment_queues_one_delayed_regroup_only_when_faces_were_found(fam, s
 def test_two_people_may_share_a_name_only_if_a_qualifier_tells_them_apart(fam):
     assert new_person(fam.owner, fam.lib, "Sarah")
     dup = fam.owner.call("POST", "/api/people", json={"library_id": fam.lib, "display_name": "  SARAH "})
-    assert dup.status_code == 409 and "qualifier" in dup.json()["detail"]
+    assert dup.status_code == 409 and "short description" in dup.json()["detail"]
     ok = fam.owner.call("POST", "/api/people", json={"library_id": fam.lib, "display_name": "Sarah", "qualifier": "cousin"})
     assert ok.status_code == 201 and ok.json()["qualifier"] == "cousin"
     assert fam.owner.call("POST", "/api/people", json={"library_id": fam.lib, "display_name": "sarah",
@@ -413,3 +413,187 @@ def test_type_ahead_only_sees_the_callers_own_group(fam):
     new_person(fam.outsider, fam.other_lib, "Sarah Elsewhere")
     r = fam.viewer.call("GET", f"/api/people/lookup?library_id={fam.lib}&q=sarah")
     assert r.json() == []
+
+
+def test_rejecting_a_group_remembers_every_face_and_removes_the_suggestion(fam, storage):
+    ann, likeann, strangers, lone = make_groups(fam)
+    cid = face_row(fam.ctx, likeann[0])[2]
+    assert fam.viewer.call("POST", f"/api/people/groups/{cid}/reject", json={"person_id": ann}).status_code == 403
+    other = new_person(fam.outsider, fam.other_lib, "Z")
+    assert fam.editor.call("POST", f"/api/people/groups/{cid}/reject", json={"person_id": other}).status_code == 404
+    assert fam.editor.call("POST", f"/api/people/groups/{cid}/reject", json={"person_id": ann}).status_code == 204
+    with fam.ctx.engine.connect() as c:
+        n = c.execute(text("SELECT count(*) FROM face_rejection WHERE person_id = :p"), {"p": ann}).scalar()
+    assert n == len(likeann)
+    groups = fam.editor.call("GET", f"/api/people/groups?library_id={fam.lib}&min_photos=1").json()["groups"]
+    assert all(g["suggestion"] is None for g in groups)
+    assert fam.editor.call("POST", f"/api/people/groups/{cid}/reject", json={"person_id": ann}).status_code == 204
+
+
+def test_naming_a_group_still_works_after_a_regroup_ran_since_the_page_loaded(fam, storage):
+    """The bug: naming one group queued a regroup that re-created every other group under a new id, so the
+    next card on the open page answered 'Group not found'."""
+    ann, likeann, strangers, lone = make_groups(fam)
+    groups = fam.editor.call("GET", f"/api/people/groups?library_id={fam.lib}&min_photos=1").json()["groups"]
+    first, second = groups[0]["id"], groups[1]["id"]
+    assert fam.editor.call("POST", f"/api/people/groups/{first}/name", json={"new_name": "Bo"}).status_code == 200
+    regroup(fam.ctx, fam.lib)                                   # the job that edit queued
+    r = fam.editor.call("POST", f"/api/people/groups/{second}/name", json={"new_name": "Cy"})
+    assert r.status_code == 200, r.text
+
+
+# ------------------------------------------------------------ reviewing and correcting a person
+
+def person_with_faces(fam, name="Ann", n=3, source="manual"):
+    pid = new_person(fam.owner, fam.lib, name)
+    faces_ = [add_face(fam.ctx, fam.lib, person_vec(), source=source, person=uuid.UUID(pid)) for _ in range(n)]
+    return pid, faces_
+
+
+def test_everyone_in_the_group_can_review_a_persons_faces_outsiders_cannot(fam, storage):
+    pid, faces_ = person_with_faces(fam)
+    for who in (fam.viewer, fam.editor):
+        r = who.call("GET", f"/api/people/{pid}/faces")
+        assert r.status_code == 200 and r.json()["total"] == 3 and len(r.json()["faces"]) == 3
+    assert fam.outsider.call("GET", f"/api/people/{pid}/faces").status_code == 404
+    assert len(fam.owner.call("GET", f"/api/people/{pid}/faces?limit=2").json()["faces"]) == 2
+
+
+def test_automatic_labels_are_listed_first_least_confident_first(fam, storage):
+    pid = new_person(fam.owner, fam.lib)
+    manual = add_face(fam.ctx, fam.lib, person_vec(), source="manual", person=uuid.UUID(pid))
+    hi, lo = (add_face(fam.ctx, fam.lib, person_vec(), source="auto", person=uuid.UUID(pid)) for _ in range(2))
+    with fam.ctx.engine.begin() as c:
+        c.execute(text("UPDATE face SET person_confidence = 0.9 WHERE id = :f"), {"f": hi})
+        c.execute(text("UPDATE face SET person_confidence = 0.6 WHERE id = :f"), {"f": lo})
+    order = [f["id"] for f in fam.viewer.call("GET", f"/api/people/{pid}/faces").json()["faces"]]
+    assert order == [str(lo), str(hi), str(manual)]
+
+
+def test_removing_faces_unlabels_them_remembers_the_rejection_and_queues_a_regroup(fam, storage):
+    pid, faces_ = person_with_faces(fam)
+    ids = [str(f) for f in faces_[:2]]
+    assert fam.viewer.call("POST", f"/api/people/{pid}/faces/remove", json={"face_ids": ids}).status_code == 403
+    r = fam.editor.call("POST", f"/api/people/{pid}/faces/remove", json={"face_ids": ids})
+    assert r.status_code == 200 and r.json() == {"removed": 2}
+    assert face_row(fam.ctx, faces_[0])[:2] == (None, None) and face_row(fam.ctx, faces_[2])[0] == uuid.UUID(pid)
+    with fam.ctx.engine.connect() as c:
+        assert c.execute(text("SELECT count(*) FROM face_rejection WHERE person_id = :p"), {"p": pid}).scalar() == 2
+    assert queued(fam.ctx, fam.lib) == 1
+
+
+def test_removed_faces_are_not_relabeled_to_the_same_person_by_a_regroup(fam, storage):
+    ann = new_person(fam.owner, fam.lib, "Ann")
+    va = person_vec()
+    add_face(fam.ctx, fam.lib, va, source="confirmed", person=uuid.UUID(ann))
+    f = add_face(fam.ctx, fam.lib, near(va, 0.25), source="auto", person=uuid.UUID(ann))
+    fam.editor.call("POST", f"/api/people/{ann}/faces/remove", json={"face_ids": [str(f)]})
+    regroup(fam.ctx, fam.lib)
+    assert face_row(fam.ctx, f)[0] is None
+
+
+def test_removing_ignores_faces_that_are_not_theirs_and_validates_the_list(fam, storage):
+    pid, faces_ = person_with_faces(fam, "Ann", 1)
+    other, others = person_with_faces(fam, "Bo", 1)
+    r = fam.owner.call("POST", f"/api/people/{pid}/faces/remove", json={"face_ids": [str(others[0]), str(uuid.uuid4())]})
+    assert r.json() == {"removed": 0} and face_row(fam.ctx, others[0])[0] == uuid.UUID(other)
+    assert fam.owner.call("POST", f"/api/people/{pid}/faces/remove", json={"face_ids": []}).status_code == 422
+    assert fam.owner.call("POST", f"/api/people/{pid}/faces/remove",
+                          json={"face_ids": [str(uuid.uuid4()) for _ in range(201)]}).status_code == 422
+    assert queued(fam.ctx, fam.lib) == 0, "nothing changed, so nothing is queued"
+
+
+def test_moving_faces_makes_them_the_new_persons_ground_truth_and_rejects_the_old(fam, storage):
+    a, a_faces = person_with_faces(fam, "Ananya", 3)
+    b = fam.owner.call("POST", "/api/people", json={"library_id": fam.lib, "display_name": "Ananya", "qualifier": "look-alike"}).json()["id"]
+    ids = [str(a_faces[0]), str(a_faces[1])]
+    assert fam.viewer.call("POST", f"/api/people/{a}/faces/move", json={"face_ids": ids, "to_person_id": b}).status_code == 403
+    r = fam.editor.call("POST", f"/api/people/{a}/faces/move", json={"face_ids": ids, "to_person_id": b})
+    assert r.status_code == 200 and r.json() == {"moved": 2}
+    assert face_row(fam.ctx, a_faces[0])[:2] == (uuid.UUID(b), "manual") and face_row(fam.ctx, a_faces[2])[0] == uuid.UUID(a)
+    with fam.ctx.engine.connect() as c:
+        assert c.execute(text("SELECT count(*) FROM face_rejection WHERE person_id = :a"), {"a": a}).scalar() == 2
+
+
+def test_moving_guards(fam, storage):
+    a, a_faces = person_with_faces(fam, "A", 1)
+    elsewhere = new_person(fam.outsider, fam.other_lib, "Z")
+    ids = [str(a_faces[0])]
+    assert fam.owner.call("POST", f"/api/people/{a}/faces/move", json={"face_ids": ids, "to_person_id": elsewhere}).status_code == 404
+    assert fam.owner.call("POST", f"/api/people/{a}/faces/move", json={"face_ids": ids, "to_person_id": a}).status_code == 422
+    assert fam.outsider.call("POST", f"/api/people/{a}/faces/move", json={"face_ids": ids, "to_person_id": a}).status_code == 404
+    assert face_row(fam.ctx, a_faces[0])[0] == uuid.UUID(a)
+
+
+def test_moving_back_clears_the_earlier_rejection_so_a_correction_can_be_undone(fam, storage):
+    a, a_faces = person_with_faces(fam, "A", 1)
+    b = new_person(fam.owner, fam.lib, "B")
+    ids = [str(a_faces[0])]
+    fam.owner.call("POST", f"/api/people/{a}/faces/move", json={"face_ids": ids, "to_person_id": b})
+    fam.owner.call("POST", f"/api/people/{b}/faces/move", json={"face_ids": ids, "to_person_id": a})
+    assert face_row(fam.ctx, a_faces[0])[0] == uuid.UUID(a)
+    with fam.ctx.engine.connect() as c:
+        assert c.execute(text("SELECT count(*) FROM face_rejection WHERE person_id = :a"), {"a": a}).scalar() == 0
+
+
+def test_best_faces_show_human_labels_and_the_clearest_first(fam, storage):
+    pid = new_person(fam.owner, fam.lib)
+    blurry_auto = add_face(fam.ctx, fam.lib, person_vec(), source="auto", person=uuid.UUID(pid), quality=0.95)
+    clear_manual = add_face(fam.ctx, fam.lib, person_vec(), source="manual", person=uuid.UUID(pid), quality=0.9)
+    small_manual = add_face(fam.ctx, fam.lib, person_vec(), source="manual", person=uuid.UUID(pid), quality=0.3)
+    got = [f["id"] for f in fam.viewer.call("GET", f"/api/people/{pid}/faces?best=true").json()["faces"]]
+    assert got == [str(clear_manual), str(small_manual), str(blurry_auto)]
+    assert len(fam.viewer.call("GET", f"/api/people/{pid}/faces?best=true&limit=1").json()["faces"]) == 1
+
+
+# --------------------------------------------- only people who show up repeatedly are asked about
+
+def add_faces_in_one_photo(ctx, lib, vecs):
+    pid = uuid.uuid4()
+    with ctx.engine.begin() as c:
+        owner = c.execute(text("SELECT created_by FROM library WHERE id = :l"), {"l": lib}).scalar()
+        c.execute(text("INSERT INTO photo (id, library_id, uploader_id, status) VALUES (:p,:l,:o,'ready')"),
+                  {"p": pid, "l": lib, "o": owner})
+        for v in vecs:
+            c.execute(text("""INSERT INTO face (id, photo_id, library_id, embedding, model_version, quality)
+                              VALUES (:i,:p,:l,:e,:m,0.9)"""),
+                      {"i": uuid.uuid4(), "p": pid, "l": lib, "e": "[" + ",".join(map(str, v.tolist())) + "]", "m": MODEL})
+
+
+def groups(fam, extra=""):
+    r = fam.editor.call("GET", f"/api/people/groups?library_id={fam.lib}{extra}")
+    assert r.status_code == 200, r.text
+    return r.json()
+
+
+def test_only_groups_seen_in_enough_different_photos_are_offered_the_rest_are_just_counted(fam, storage):
+    often, rare, once = person_vec(), person_vec(), person_vec()
+    for _ in range(4):
+        add_face(fam.ctx, fam.lib, near(often, 0.1))          # 4 photos: offered
+    for _ in range(2):
+        add_face(fam.ctx, fam.lib, near(rare, 0.1))           # 2 photos: below the line
+    add_faces_in_one_photo(fam.ctx, fam.lib, [near(once, 0.05) for _ in range(3)])  # 3 faces but ONE photo
+    regroup(fam.ctx, fam.lib)
+    got = groups(fam)
+    assert [(g["size"], g["photos"]) for g in got["groups"]] == [(4, 4)]
+    assert got["hidden"] == 2 and got["min_photos"] == 3
+    everything = groups(fam, "&min_photos=1")
+    assert len(everything["groups"]) == 3 and everything["hidden"] == 0
+
+
+def test_a_hidden_group_appears_by_itself_once_it_shows_up_in_enough_photos(fam, storage):
+    v = person_vec()
+    for _ in range(2):
+        add_face(fam.ctx, fam.lib, near(v, 0.1))
+    regroup(fam.ctx, fam.lib)
+    assert groups(fam) == {"groups": [], "hidden": 1, "min_photos": 3}
+    add_face(fam.ctx, fam.lib, near(v, 0.1))
+    regroup(fam.ctx, fam.lib)
+    got = groups(fam)
+    assert [g["photos"] for g in got["groups"]] == [3] and got["hidden"] == 0
+
+
+def test_the_threshold_is_validated_and_nothing_is_queued_by_looking(fam, storage):
+    assert fam.editor.call("GET", f"/api/people/groups?library_id={fam.lib}&min_photos=0").status_code == 422
+    assert groups(fam) == {"groups": [], "hidden": 0, "min_photos": 3}
+    assert queued(fam.ctx, fam.lib) == 0

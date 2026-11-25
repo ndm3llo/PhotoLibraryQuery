@@ -86,6 +86,10 @@ def test_login_page_and_config_are_public_but_never_leak_secrets(app_db, monkeyp
     upload = client.get("/upload")
     assert upload.status_code == 200 and "Upload photos" in upload.text and upload.headers["x-frame-options"] == "DENY"
 
+    people_page = client.get("/people")
+    assert people_page.status_code == 200 and "Who is this?" in people_page.text
+    assert people_page.headers["x-frame-options"] == "DENY" and people_page.headers["cache-control"] == "no-store"
+
     cfg = client.get("/api/config")
     assert cfg.json() == {"supabase_url": "https://test.supabase.co", "supabase_anon_key": "sb_publishable_testkey"}
     assert "SECRET-R2-KEY" not in cfg.text + page.text

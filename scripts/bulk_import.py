@@ -3,6 +3,7 @@
     export ALBUM_TOKEN=<access token from /login > Copy access token>
     python scripts/bulk_import.py ~/Pictures/family --library <library-id>
     python scripts/bulk_import.py ~/Pictures/family --dry-run
+    python scripts/bulk_import.py app_imgs --label-folders   # keep each photo's folder in its filename
 
 Files go straight to storage with presigned URLs; this script then waits for the worker to finish them
 (so `python -m app.worker` must be running). Tokens last about an hour: for very large imports, run it
@@ -27,6 +28,13 @@ def find_files(folder: Path) -> list[Path]:
                   if p.is_file() and p.suffix.lower() in EXTENSIONS and not any(part.startswith(".") for part in p.parts))
 
 
+def upload_name(path: Path, root: Path, label_folders: bool) -> str:
+    """The filename to store. With --label-folders, folders are kept as a prefix ("ananya__IMG1.jpg",
+    "others__looks_like_ari__IMG2.jpg"), which preserves labeled test folders for later checking."""
+    rel = path.relative_to(root)
+    return "__".join(rel.parts) if label_folders and len(rel.parts) > 1 else path.name
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("folder", type=Path)
@@ -36,15 +44,18 @@ def main() -> int:
     ap.add_argument("--batch", type=int, default=25)
     ap.add_argument("--threads", type=int, default=4)
     ap.add_argument("--timeout", type=int, default=1800, help="seconds to wait for processing")
+    ap.add_argument("--label-folders", action="store_true",
+                    help="store each photo's folder path in its filename (for labeled test folders)")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
 
-    files = find_files(args.folder.expanduser())
+    root = args.folder.expanduser()
+    files = find_files(root)
     total_mb = sum(f.stat().st_size for f in files) / 1e6
     print(f"{len(files)} photo(s), {total_mb:.1f} MB in {args.folder}")
     if args.dry_run or not files:
         for f in files[:20]:
-            print("  ", f.name)
+            print("  ", upload_name(f, root, args.label_folders))
         return 0
     if not args.token:
         print("No token. Sign in at /login, click 'Copy access token', then `export ALBUM_TOKEN=...`", file=sys.stderr)
@@ -63,7 +74,7 @@ def main() -> int:
     errors: list[str] = []
     for start in range(0, len(files), args.batch):
         chunk = files[start:start + args.batch]
-        specs = [{"filename": f.name, "size": f.stat().st_size, "content_type": "",
+        specs = [{"filename": upload_name(f, root, args.label_folders), "size": f.stat().st_size, "content_type": "",
                   "last_modified": int(f.stat().st_mtime * 1000)} for f in chunk]
         body = {"files": specs}
         if args.library:
@@ -85,10 +96,10 @@ def main() -> int:
             sent = []
             for path, pid, err in pool.map(send, zip(chunk, uploads)):
                 if err:
-                    errors.append(f"{path.name}: {err}")
+                    errors.append(f"{upload_name(path, root, args.label_folders)}: {err}")
                 else:
                     sent.append(pid)
-                    ids[pid] = path.name
+                    ids[pid] = upload_name(path, root, args.label_folders)
         if sent:
             done = call("POST", "/api/uploads/complete", json={"photo_ids": sent}).json()["results"]
             for res in done:

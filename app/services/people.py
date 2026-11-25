@@ -22,6 +22,7 @@ Matching tiers (cutoffs in app/config.py, chosen with scripts/eval_faces.py):
 Scale: galleries are loaded into memory and compared with numpy. That is the right tool for one family
 (tens of thousands of faces); revisit with pgvector queries only if a library grows far beyond that.
 """
+import unicodedata
 from dataclasses import dataclass
 from typing import Iterable, Literal
 from uuid import UUID
@@ -127,18 +128,27 @@ def cluster_faces(embeddings: list, max_distance: float = FACE_AUTO_MAX, order: 
     return sorted(members, key=len, reverse=True)
 
 
+def fold(text_: str) -> str:
+    """How names are compared when searching: ignores capitals, accents, and extra spaces, so "MARIA", "maria"
+    and " María " are the same name (and "Jose" finds "José"). Display always keeps the original spelling."""
+    decomposed = unicodedata.normalize("NFKD", text_)
+    stripped = "".join(ch for ch in decomposed if not unicodedata.combining(ch))
+    return " ".join(stripped.casefold().split())
+
+
 def rank_names(query: str, candidates: list[dict], limit: int = 8) -> list[dict]:
     """Type-ahead over a library's people. `candidates` are dicts with display_name, qualifier, aliases.
     Ranked: exact name, name starts with the text, a nickname starts with it, any word of the name/qualifier
-    starts with it. Case and surrounding spaces are ignored. Adds `via_alias` when a nickname was what matched."""
-    q = " ".join(query.lower().split())
+    starts with it. Capitals, accents and extra spaces are ignored (see `fold`). Adds `via_alias` when a nickname
+    was what matched."""
+    q = fold(query)
     if not q:
         return []
     scored = []
     for c in candidates:
-        name = c["display_name"].lower().strip()
-        full = f"{name} {(c.get('qualifier') or '').lower()}".strip()
-        alias = next((a for a in sorted(c.get("aliases") or [], key=len) if a.lower().strip().startswith(q)), None)
+        name = fold(c["display_name"])
+        full = f"{name} {fold(c.get('qualifier') or '')}".strip()
+        alias = next((a for a in sorted(c.get("aliases") or [], key=len) if fold(a).startswith(q)), None)
         if q in (name, full):
             rank, via = 0, None
         elif name.startswith(q) or full.startswith(q):
@@ -193,15 +203,45 @@ def assign_library_faces(session: Session, library_id: UUID, model: str) -> dict
 
 def recluster_library(session: Session, library_id: UUID, model: str) -> dict[str, int]:
     """Group the faces that still have no person into clusters (what the "Who is this?" page shows).
-    Only UNNAMED clusters are rebuilt; a cluster a person has named is never touched."""
-    session.execute(text("DELETE FROM face_cluster WHERE library_id = :l AND person_id IS NULL"), {"l": library_id})
-    rows = session.execute(text("""SELECT id, embedding, COALESCE(quality, 0) FROM face
-                                    WHERE library_id = :l AND model_version = :m AND person_id IS NULL
-                                      AND cluster_id IS NULL"""), {"l": library_id, "m": model}).all()
+
+    Group IDs are STABLE: a regroup moves faces between existing unnamed groups and reuses the ID of the old
+    group each new group overlaps most, so a page that is open while a regroup runs still points at real groups.
+    Only unnamed groups are touched; a group a person has named is never rebuilt."""
+    rows = session.execute(text("""
+        SELECT f.id, f.embedding, COALESCE(f.quality, 0), f.cluster_id FROM face f
+         WHERE f.library_id = :l AND f.model_version = :m AND f.person_id IS NULL"""),
+        {"l": library_id, "m": model}).all()
+    unnamed = {r[0] for r in session.execute(
+        text("SELECT id FROM face_cluster WHERE library_id = :l AND person_id IS NULL"), {"l": library_id})}
     groups = cluster_faces([r[1] for r in rows], order=[float(r[2]) for r in rows])
-    for g in groups:
-        cid = session.execute(text("""INSERT INTO face_cluster (library_id, model_version) VALUES (:l, :m)
-                                       RETURNING id"""), {"l": library_id, "m": model}).scalar_one()
+
+    # Pair each new group with the old unnamed group it shares the most faces with (each used at most once).
+    overlaps = []
+    for gi, g in enumerate(groups):
+        counts: dict[UUID, int] = {}
+        for i in g:
+            old = rows[i][3]
+            if old in unnamed:
+                counts[old] = counts.get(old, 0) + 1
+        overlaps += [(n, gi, old) for old, n in counts.items()]
+    group_id: dict[int, UUID] = {}
+    used: set[UUID] = set()
+    for n, gi, old in sorted(overlaps, key=lambda t: (-t[0], str(t[2]))):
+        if gi not in group_id and old not in used:
+            group_id[gi] = old
+            used.add(old)
+
+    for gi, g in enumerate(groups):
+        if gi not in group_id:
+            group_id[gi] = session.execute(
+                text("INSERT INTO face_cluster (library_id, model_version) VALUES (:l, :m) RETURNING id"),
+                {"l": library_id, "m": model}).scalar_one()
         session.execute(text("UPDATE face SET cluster_id = :c WHERE id = ANY(:ids)"),
-                        {"c": cid, "ids": [rows[i][0] for i in g]})
+                        {"c": group_id[gi], "ids": [rows[i][0] for i in g]})
+    # Faces that now have a person (automatic labels) leave their old unnamed group; emptied groups disappear.
+    session.execute(text("UPDATE face SET cluster_id = NULL WHERE library_id = :l AND person_id IS NOT NULL "
+                         "AND cluster_id IN (SELECT id FROM face_cluster WHERE library_id = :l AND person_id IS NULL)"),
+                    {"l": library_id})
+    session.execute(text("""DELETE FROM face_cluster c WHERE c.library_id = :l AND c.person_id IS NULL
+                               AND NOT EXISTS (SELECT 1 FROM face f WHERE f.cluster_id = c.id)"""), {"l": library_id})
     return {"faces": len(rows), "clusters": len(groups)}

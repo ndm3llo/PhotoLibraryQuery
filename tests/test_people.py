@@ -298,3 +298,48 @@ def test_type_ahead_is_limited_and_does_not_treat_input_as_a_pattern():
     cands = [_c(f"Sam {i}") for i in range(20)]
     assert len(people.rank_names("sam", cands, limit=5)) == 5
     assert people.rank_names("%", cands) == [] and people.rank_names(".*", cands) == []
+
+
+def test_group_ids_survive_a_regroup_and_new_faces_join_the_existing_group(lib):
+    first = [lib.add_face(near(VA, 0.15)) for _ in range(3)]
+    other = [lib.add_face(near(VB, 0.15)) for _ in range(2)]
+    with lib.rls.service_session() as s:
+        people.recluster_library(s, lib.id, MODEL)
+    ids_before = (lib.row(first[0])[2], lib.row(other[0])[2])
+    assert ids_before[0] != ids_before[1]
+    newcomer = lib.add_face(near(VA, 0.15))
+    with lib.rls.service_session() as s:
+        people.recluster_library(s, lib.id, MODEL)
+        people.recluster_library(s, lib.id, MODEL)
+    assert (lib.row(first[0])[2], lib.row(other[0])[2]) == ids_before, "group ids must not change on a regroup"
+    assert lib.row(newcomer)[2] == ids_before[0]
+    assert {lib.row(f)[2] for f in first} == {ids_before[0]}
+
+
+def test_a_group_that_vanishes_is_deleted_and_an_auto_labeled_face_leaves_its_group(lib):
+    lib.add_face(VA, "confirmed", lib.ann)
+    a = [lib.add_face(near(VA, 0.25)) for _ in range(2)]
+    with lib.rls.service_session() as s:
+        people.recluster_library(s, lib.id, MODEL)
+    assert lib.row(a[0])[2] is not None
+    with lib.rls.service_session() as s:
+        people.assign_library_faces(s, lib.id, MODEL)      # both now match Ann automatically
+        people.recluster_library(s, lib.id, MODEL)
+        n = s.execute(text("SELECT count(*) FROM face_cluster WHERE library_id = :l"), {"l": lib.id}).scalar()
+    assert n == 0 and lib.row(a[0])[2] is None and lib.row(a[0])[:2] == (lib.ann, "auto")
+
+
+def test_type_ahead_ignores_capitals_accents_and_spacing_in_the_query_and_the_names():
+    cands = [_c("María José"), _c("Zoë", aliases=["Abuela"]), _c("STRASSE"), _c("Maya", "Blonde")]
+    for query in ("maria", "MARIA", "  María  ", "mArÍa jose", "jose"):
+        assert [c["display_name"] for c in people.rank_names(query, cands)] == ["María José"], query
+    assert [c["display_name"] for c in people.rank_names("zoe", cands)] == ["Zoë"]
+    assert people.rank_names("ABUELA", cands)[0]["via_alias"] == "Abuela", "the stored nickname keeps its spelling"
+    assert [c["display_name"] for c in people.rank_names("strasse", cands)] == ["STRASSE"]
+    assert [c["display_name"] for c in people.rank_names("MAYA BLONDE", cands)] == ["Maya"]
+
+
+def test_fold_is_stable_for_already_plain_text_and_keeps_non_latin_letters():
+    assert people.fold("Mimi") == "mimi" and people.fold("  A  B ") == "a b"
+    assert people.fold("Ñandú") == "nandu" and people.fold("Ana") == people.fold("ANA")
+    assert people.fold("李明") == "李明", "names in other scripts must not be mangled"
