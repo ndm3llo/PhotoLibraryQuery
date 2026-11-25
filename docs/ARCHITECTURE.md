@@ -493,6 +493,23 @@ Implemented as the **expand** half of an expand/contract migration: new structur
 7. **Nobody has to name everyone** (owner, 2026-11-22): "Who is this?" lists only unnamed groups whose faces appear in at least `FACE_GROUP_MIN_PHOTOS` (3) *different photos* (three faces in one photo do not count). Rarer faces are only counted ("N faces seen in only a few photos are hidden"), with a "show them anyway" switch; a group that keeps appearing crosses the line on its own. Pull-only, like everything else here.
 8. **Same name, two people:** allowed, but the pair (name, `qualifier`) is unique per library (`uq_person_name`), so two Sarahs must be told apart ("Sarah" and "Sarah, cousin"). Enrollment: a name that matches an unclaimed person offers "is this you?" with photos; a claimed one offers a new person with a qualifier; no match creates one. Search asks "which Sarah?" when ambiguous.
 
+**4c progress (started 2026-11-25; screens and rules in [UI_SPEC.md](UI_SPEC.md))**
+
+- [x] Join by link or six-character code: migration `0009` (applied to the live
+  database 2026-11-25 after a backup and a rehearsal on a restored copy: data unchanged, downgrade and re-upgrade clean),
+  `app/services/join.py`, `GET/PUT/DELETE /api/libraries/{id}/join-link`, `.../reset`, `POST /api/invites/join`,
+  `library_member.joined_at`. One reusable link per album, editor or viewer, 30 days, owners only. Wrong codes are
+  limited per account and per address; link tokens are not limited. Token and code are stored readable (owners only,
+  RLS) so they can be shown again. This replaces decision 6's email-bound invites for the app; the email invite
+  endpoints remain. Tests: `tests/test_join_links.py` (the safety rules were mutation-checked).
+- [ ] The `/join` page that the link opens (comes with the sign-up and join screens).
+- [x] Removing a member expires the link and code (owner, 2026-11-25; database trigger, so any path does it). Leaving
+  on your own does not.
+- [ ] **Open:** someone changed to viewer can leave and rejoin through an editor link, regaining editor.
+- [ ] Hosting (Phase 7): pass the real client address through any proxy, or all users share one address limit.
+- [ ] Still to do in 4c: sign-up and album screens, account selfie and consent, per-album recognition consent, names
+  and claim a person, opt-out and data deletion, guardian handling, abuse limits.
+
 **4a. Face model (done)**
 
 - [x] **Benchmark and switch.** Same labeled faces, same measures. Facenet512 (DeepFace, the prototype's model): nearest stranger at distance 0.48, same-person 90th percentile 0.35 (a gap of 0.13). InsightFace `buffalo_l`: nearest stranger 0.79, same-person 90th percentile 0.42 (a gap of 0.37), 99% closed-set accuracy vs 96% on the common faces, 7/7 vs 5/7 on faces under 60 px, about 4x faster. Adopted. DeepFace, RetinaFace, TensorFlow and tf_keras are removed from `requirements.txt`.

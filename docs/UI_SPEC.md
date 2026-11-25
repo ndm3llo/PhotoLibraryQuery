@@ -103,6 +103,8 @@ can use it without help. The audience is the people an owner invites, **family a
   - Only owners and editors can upload, so an uploader differs only if later changed to viewer. Such a person does
     **not** get the pop-up and cannot name (owner, 2026-11-25): naming stays owners and editors only.
 - **Leaving an album** keeps the photos that person added (confirmed 2026-11-25).
+- **Removing a member** also resets the invite link and code (confirmed 2026-11-25). The confirmation should say so:
+  "The invite link will change. Send the new one to anyone who hasn't joined yet."
 
 ## Error messages (owner left these to Claude)
 

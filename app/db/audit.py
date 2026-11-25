@@ -11,7 +11,7 @@ from app.db.rls import service_session
 logger = logging.getLogger(__name__)
 
 
-def _valid_ip(ip: str | None) -> str | None:
+def valid_ip(ip: str | None) -> str | None:
     """The client 'host' is not always an IP (proxies, unix sockets, test clients); store NULL then."""
     if not ip:
         return None
@@ -31,7 +31,7 @@ def audit(actor: UUID | None, action: str, *, library_id: UUID | None = None,
                 text("INSERT INTO audit_log (actor, library_id, action, target, ip, meta) "
                      "VALUES (:actor, :lib, :action, :target, CAST(:ip AS inet), CAST(:meta AS jsonb))"),
                 {"actor": actor, "lib": library_id, "action": action, "target": target,
-                 "ip": _valid_ip(ip), "meta": json.dumps(meta) if meta else None},
+                 "ip": valid_ip(ip), "meta": json.dumps(meta) if meta else None},
             )
     except Exception:
         logger.exception("audit write failed: action=%s library=%s", action, library_id)

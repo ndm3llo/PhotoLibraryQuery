@@ -24,6 +24,13 @@ def app_base_url() -> str:
 
 INVITE_TTL_DAYS = 7
 
+# Joining by shareable link or six-character code (app/services/join.py). Wrong codes are limited per account and
+# per network address; behind a proxy the address must be the real client's, or everyone shares one limit.
+JOIN_LINK_TTL_DAYS = 30
+JOIN_ATTEMPTS_PER_USER = 10
+JOIN_ATTEMPTS_PER_IP = 30
+JOIN_ATTEMPT_WINDOW_MINUTES = 15
+
 
 # Face matching distances: cosine distance between L2-normalised InsightFace buffalo_l embeddings.
 # PROVISIONAL. Chosen from the 2026-11-21 evaluation on the labeled sample set (69-77 known faces, 15 strangers):

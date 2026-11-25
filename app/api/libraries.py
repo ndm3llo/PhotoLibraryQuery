@@ -1,5 +1,8 @@
 """Libraries, members, and invites.
 
+There are two ways in: the shareable join link with its six-character code (what the app uses), and the older
+single-use invite tied to an email address.
+
 Roles: owner (manages members, invites, library settings), editor (uploads, labels people; the default
 for an invite), viewer (read-only). A library always keeps at least one owner (enforced by a database trigger).
 Authorization is enforced twice: explicit checks here for clear errors, and Row Level Security
@@ -13,15 +16,17 @@ from typing import Literal
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError
 from sqlmodel import Session
 
 from app.auth.deps import current_user, get_rls_session, require_role
 from app.auth.jwt import AuthUser
+from app.auth.profiles import ensure_profile
 from app.config import INVITE_TTL_DAYS, app_base_url
-from app.db.audit import audit
+from app.db.audit import audit, valid_ip
+from app.services import join as joining
 
 router = APIRouter()
 invites_router = APIRouter()
@@ -53,6 +58,21 @@ class InviteCreate(BaseModel):
 
 class InviteAccept(BaseModel):
     token: str = Field(min_length=20, max_length=200)
+
+
+class JoinLinkSettings(BaseModel):
+    role: Literal["editor", "viewer"] | None = None  # nobody becomes an owner through a shareable link
+
+
+class JoinRequest(BaseModel):
+    token: str | None = Field(default=None, min_length=20, max_length=200)
+    code: str | None = Field(default=None, min_length=1, max_length=40)
+
+    @model_validator(mode="after")
+    def _exactly_one(self):
+        if (self.token is None) == (self.code is None):
+            raise ValueError("send either a token or a code")
+        return self
 
 
 def _ip(request: Request) -> str | None:
@@ -110,13 +130,13 @@ def list_members(library_id: UUID, user: AuthUser = Depends(current_user),
                  session: Session = Depends(get_rls_session)):
     require_role(session, user.id, library_id, ("owner", "editor", "viewer"))
     rows = session.execute(
-        text("SELECT m.profile_id, p.handle, p.display_name, m.role FROM library_member m "
+        text("SELECT m.profile_id, p.handle, p.display_name, m.role, m.joined_at FROM library_member m "
              "JOIN profile p ON p.id = m.profile_id WHERE m.library_id = :l "
              "ORDER BY m.role, p.display_name"),
         {"l": library_id},
     ).all()
     return [{"profile_id": r.profile_id, "handle": r.handle, "display_name": r.display_name,
-             "role": r.role} for r in rows]
+             "role": r.role, "joined_at": r.joined_at} for r in rows]
 
 
 @router.patch("/{library_id}/members/{profile_id}")
@@ -143,7 +163,11 @@ def change_member_role(library_id: UUID, profile_id: UUID, body: RoleChange, req
 @router.delete("/{library_id}/members/{profile_id}", status_code=204)
 def remove_member(library_id: UUID, profile_id: UUID, request: Request,
                   user: AuthUser = Depends(current_user), session: Session = Depends(get_rls_session)):
-    """Owners can remove anyone; any member can remove themselves (leave)."""
+    """Owners can remove anyone; any member can remove themselves (leave).
+
+    Removing someone else also stops the library's invite link and code (a database trigger), so they cannot rejoin
+    with it. The next time an owner opens the invite screen they get a new one.
+    """
     role = require_role(session, user.id, library_id, ("owner", "editor", "viewer"))
     if role != "owner" and profile_id != user.id:
         raise HTTPException(403, "Insufficient permissions")
@@ -228,6 +252,71 @@ def revoke_invite(library_id: UUID, invite_id: UUID, request: Request,
     if res.rowcount == 0:
         raise HTTPException(404, "Invite not found")
     audit(user.id, "invite.revoke", library_id=library_id, target=str(invite_id), ip=_ip(request))
+
+
+# ------------------------------------------------------------- join link and code
+
+def _link_body(row) -> dict:
+    # The token goes after '#', which browsers never send to a server, so it stays out of access logs.
+    return {"role": row.role, "code": joining.format_code(row.code),
+            "link": f"{app_base_url()}/join#{row.token}", "expires_at": row.expires_at}
+
+
+@router.get("/{library_id}/join-link")
+def get_join_link(library_id: UUID, user: AuthUser = Depends(current_user),
+                  session: Session = Depends(get_rls_session)):
+    require_role(session, user.id, library_id, ("owner",))
+    row = joining.active_link(session, library_id)
+    if row is None:
+        raise HTTPException(404, "There is no active invite link")
+    return _link_body(row)
+
+
+@router.put("/{library_id}/join-link")
+def put_join_link(library_id: UUID, body: JoinLinkSettings, request: Request,
+                  user: AuthUser = Depends(current_user), session: Session = Depends(get_rls_session)):
+    """Show the invite link and code, creating them if needed, and optionally set what joiners can do."""
+    require_role(session, user.id, library_id, ("owner",))
+    row = joining.save_link(library_id, user.id, body.role)
+    audit(user.id, "join_link.save", library_id=library_id, ip=_ip(request), meta={"role": row.role})
+    return _link_body(row)
+
+
+@router.post("/{library_id}/join-link/reset")
+def reset_join_link(library_id: UUID, request: Request, user: AuthUser = Depends(current_user),
+                    session: Session = Depends(get_rls_session)):
+    """Replace the link and code. The old ones stop working at once."""
+    require_role(session, user.id, library_id, ("owner",))
+    row = joining.save_link(library_id, user.id, reset=True)
+    audit(user.id, "join_link.reset", library_id=library_id, ip=_ip(request))
+    return _link_body(row)
+
+
+@router.delete("/{library_id}/join-link", status_code=204)
+def delete_join_link(library_id: UUID, request: Request, user: AuthUser = Depends(current_user),
+                     session: Session = Depends(get_rls_session)):
+    require_role(session, user.id, library_id, ("owner",))
+    session.execute(text("DELETE FROM library_join_link WHERE library_id = :l"), {"l": library_id})
+    session.commit()
+    audit(user.id, "join_link.delete", library_id=library_id, ip=_ip(request))
+
+
+@invites_router.post("/join")
+def join_library(body: JoinRequest, request: Request, user: AuthUser = Depends(current_user)):
+    """Join with an invite link or a six-character code."""
+    ensure_profile(user)
+    try:
+        joined = joining.join(user.id, token=body.token, code=body.code, ip=valid_ip(_ip(request)))
+    except joining.TooManyAttempts:
+        raise HTTPException(429, "Too many tries. Wait a few minutes, then try again.") from None
+    except joining.InvalidInvite:
+        detail = ("This invite no longer works. Ask for a new link." if body.code is None
+                  else "That code didn't work. Check the letters and try again.")
+        raise HTTPException(400, detail) from None
+    if not joined.already_member:
+        audit(user.id, "member.join", library_id=joined.library_id, ip=_ip(request), meta={"role": joined.role})
+    return {"library_id": joined.library_id, "name": joined.name, "role": joined.role,
+            "already_member": joined.already_member}
 
 
 @invites_router.post("/accept")
