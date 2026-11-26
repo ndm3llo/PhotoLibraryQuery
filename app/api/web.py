@@ -1,4 +1,4 @@
-"""Minimal developer sign-in page and the public config it needs.
+"""The web pages (the Memoria app and the older developer pages) and the public config they need.
 
 Everything returned here is public by design: the project URL and the anon/publishable key are
 meant to be embedded in client apps. NEVER expose the service-role key.
@@ -7,7 +7,7 @@ import os
 from pathlib import Path
 
 from fastapi import APIRouter, HTTPException
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, Response
 
 from app.config import supabase_url
 
@@ -28,6 +28,36 @@ def public_config():
     if not anon_key:
         raise HTTPException(status_code=503, detail="SUPABASE_ANON_KEY is not set")
     return {"supabase_url": supabase_url(), "supabase_anon_key": anon_key}
+
+
+def _app_policy() -> str:
+    """Only our own script and style may run; the page talks to this server and the sign-in service only."""
+    try:
+        auth = " " + supabase_url()
+    except RuntimeError:
+        auth = ""
+    return ("default-src 'none'; script-src 'self'; style-src 'self'; "
+            # Photos come from signed storage links (https), or a local stand-in during development.
+            "img-src 'self' data: https: http://localhost:* http://127.0.0.1:*; "
+            f"connect-src 'self'{auth}; base-uri 'none'; form-action 'self'; frame-ancestors 'none'")
+
+
+# "/join" is where an invite link lands; the token follows "#", so it never reaches the server.
+@router.get("/app", response_class=HTMLResponse, include_in_schema=False)
+@router.get("/join", response_class=HTMLResponse, include_in_schema=False)
+def app_page():
+    return HTMLResponse((_WEB / "app.html").read_text(encoding="utf-8"),
+                        headers={**_HEADERS, "Content-Security-Policy": _app_policy()})
+
+
+@router.get("/assets/app.js", include_in_schema=False)
+def app_script():
+    return Response((_WEB / "app.js").read_text(encoding="utf-8"), media_type="text/javascript", headers=_HEADERS)
+
+
+@router.get("/assets/app.css", include_in_schema=False)
+def app_style():
+    return Response((_WEB / "app.css").read_text(encoding="utf-8"), media_type="text/css", headers=_HEADERS)
 
 
 @router.get("/login", response_class=HTMLResponse, include_in_schema=False)

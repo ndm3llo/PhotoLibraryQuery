@@ -165,6 +165,8 @@
     var writable = me.libraries.filter(function (l) { return l.role !== "viewer"; });
     if (!writable.length) { $("needlogin").hidden = false; $("needlogin").firstElementChild.textContent = "You do not have a library you can upload to yet."; return; }
     writable.forEach(function (l) { var o = document.createElement("option"); o.value = l.id; o.textContent = l.name + " (" + l.role + ")"; $("library").appendChild(o); });
+    var asked = new URLSearchParams(location.search).get("library");  // set by the app's "Add photos" button
+    if (writable.some(function (l) { return l.id === asked; })) $("library").value = asked;
     $("form").hidden = false;
     $("files").addEventListener("change", function () { $("go").disabled = !$("files").files.length; $("summary").textContent = $("files").files.length + " file(s) selected"; });
     $("go").addEventListener("click", start);

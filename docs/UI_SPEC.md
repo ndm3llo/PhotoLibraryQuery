@@ -1,7 +1,10 @@
 # UI specification (draft, 2026-11-23, updated 2026-11-25)
 
 Status: mockups exist (a private design canvas, "Memoria mockups"); the owner **approved the look on 2026-11-25**,
-including the grid home screen and the collection screens. Nothing in this file is built yet.
+including the grid home screen and the collection screens. A **first slice is built** at `/app` (2026-11-25): sign in,
+create account, forgot password, home grid, create album, join (link or code), invite, a plain photo grid, settings
+(name, sign out), album settings (rename, invite, leave) and the **filter screen** (people, when, added by; a full
+screen rather than a bottom sheet). Everything else here is not built.
 Companion to [ARCHITECTURE.md](ARCHITECTURE.md). The developer-grade pages under `app/web/` are throwaway.
 
 ## Who it is for
@@ -58,7 +61,8 @@ can use it without help. The audience is the people an owner invites, **family a
    - Order when **creating** an album: album name, your name here, recognition consent, invite, then the album.
      Someone **joining** does not get the invite step (the clickable mockup shows it for both).
 8. **Photos** (inside an album): a **Collections** row (with "See all"), then **All photos** with a **Select** button,
-   the filter chips, and the grid by month; tabs Photos / Search / People / Add.
+   one **Filter** button (owner, 2026-11-25: not three separate chips), and the grid by month; tabs Photos / Search /
+   People / Add. With filters on, the button is highlighted and the choices are written out underneath.
 9. **Filter photos** (a bottom sheet): **People** (tap faces to pick; "Together" = everyone selected is in the photo,
    or "Any of them"), **When** (any time, a year, pick dates, on this day, **no date**: photos with no known date, so
    they can be fixed), **Added by**. The button always says how many photos match ("Show 36 photos"). Planned later:
@@ -103,7 +107,7 @@ can use it without help. The audience is the people an owner invites, **family a
   - Only owners and editors can upload, so an uploader differs only if later changed to viewer. Such a person does
     **not** get the pop-up and cannot name (owner, 2026-11-25): naming stays owners and editors only.
 - **Leaving an album** keeps the photos that person added (confirmed 2026-11-25).
-- **Removing a member** also resets the invite link and code (confirmed 2026-11-25). The confirmation should say so:
+- **Removing a member, or reducing their access,** also resets the invite link and code (confirmed 2026-11-25). The confirmation should say so:
   "The invite link will change. Send the new one to anyone who hasn't joined yet."
 
 ## Error messages (owner left these to Claude)
@@ -125,6 +129,12 @@ person already typed.
 | Only owner leaving | "You're the only owner. Make someone else an owner first." |
 | Anything else | "Something went wrong. Please try again." |
 
+## Photo viewer: loading behaviour (planned, screen not designed)
+
+Tapping a photo opens it large on top of the grid, with previous, next, the date taken and Close. Closing returns to the
+same place with the same filters. Photos on screen after filtering (up to 12) and the neighbouring photos are prepared
+quietly so they open quickly. Details: [ARCHITECTURE.md](ARCHITECTURE.md), "Loading speed".
+
 ## Not yet designed
 
 "See all" collections, picking photos after "Select", photo viewer, People tab and the full "Who is this?" naming
@@ -137,6 +147,11 @@ laptop layouts, and the guardian flow for children.
 - Invite codes and the account-level selfie need new tables (see ARCHITECTURE.md, Phase 4c) and abuse limits (groups per
   account, storage per album, upload rate).
 - Light and dark colours are defined once as variables (see the mockups' `:root` blocks).
+
+## Dates
+
+A photo whose only date comes from the file itself (when it was saved or copied) shows under **No date** (owner,
+2026-11-25). Camera dates, dates in the file name and dates set by hand count.
 
 ## Matching rules (search, type-ahead, codes)
 

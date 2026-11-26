@@ -1,7 +1,8 @@
 import os
+import time
 
 from dotenv import dotenv_values, find_dotenv, load_dotenv
-from sqlalchemy.pool import NullPool
+from sqlalchemy import event, exc
 from sqlmodel import Session, create_engine, text
 
 # Import all models so SQLModel's registry knows about them (used by ORM queries).
@@ -42,7 +43,31 @@ database_url = os.getenv("DATABASE_URL") or os.getenv("postgres_url")
 if not database_url:
     raise RuntimeError("Set DATABASE_URL or postgres_url")
 
-engine = create_engine(database_url, poolclass=NullPool)
+# Connections are kept open and reused: opening one to a hosted database takes most of a second. This works with
+# Supabase's transaction pooler because identity is only ever set for one transaction (app/db/rls.py).
+engine = create_engine(database_url, pool_size=5, max_overflow=10, pool_recycle=300)
+
+# A connection that sat unused may have been closed by the server or the network. Test those before use, and only
+# those: testing every time would add a network round trip to every request.
+IDLE_CHECK_SECONDS = 30
+
+
+@event.listens_for(engine, "checkin")
+def _note_idle_start(_connection, record):
+    record.info["idle_since"] = time.monotonic()
+
+
+@event.listens_for(engine, "checkout")
+def _replace_dead_connection(connection, record, _proxy):
+    idle_since = record.info.get("idle_since")
+    if idle_since is None or time.monotonic() - idle_since < IDLE_CHECK_SECONDS:
+        return
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT 1")
+        connection.rollback()
+    except Exception as e:
+        raise exc.DisconnectionError() from e  # the pool opens a fresh one and carries on
 
 
 def init_db():

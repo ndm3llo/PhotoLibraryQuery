@@ -28,9 +28,11 @@ def rls_session(user_id: UUID, extra_claims: dict | None = None) -> Iterator[Ses
 
     @event.listens_for(session, "after_begin")
     def _apply_identity(_session, _transaction, connection):
-        connection.exec_driver_sql("SET LOCAL ROLE authenticated")
+        # One statement (one network round trip). The final `true` limits each setting to this transaction, like
+        # SET LOCAL, so a reused connection never carries one person's identity into the next request.
         connection.execute(
-            text("SELECT set_config('request.jwt.claims', :claims, true), "
+            text("SELECT set_config('role', 'authenticated', true), "
+                 "set_config('request.jwt.claims', :claims, true), "
                  "set_config('request.jwt.claim.sub', :sub, true)"),
             {"claims": payload, "sub": str(user_id)},
         )

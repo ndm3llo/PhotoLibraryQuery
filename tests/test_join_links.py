@@ -278,6 +278,42 @@ def test_removal_directly_in_the_database_also_stops_the_link(ctx):
     assert with_link(ana, link).status_code == 400
 
 
+def change_role(actor, lib, person, role):
+    return actor.call("PATCH", f"/api/libraries/{lib}/members/{person.id}", json={"role": role})
+
+
+@pytest.mark.parametrize("before,after", [("editor", "viewer"), ("owner", "editor"), ("owner", "viewer")])
+def test_reducing_someones_access_stops_the_link(ctx, before, after):
+    owner, ana = User(ctx, "owner"), User(ctx, "ana")
+    lib = make_library(owner)
+    join(owner, lib, ana, before)
+    old = new_link(owner, lib, role="editor")
+    assert change_role(owner, lib, ana, after).status_code == 200
+    assert remove(ana, lib, ana).status_code == 204, "they leave..."
+    assert with_link(ana, old).status_code == 400, "...and cannot come back with more access"
+    assert with_code(ana, old["code"]).status_code == 400
+    assert new_link(owner, lib)["role"] == "editor", "the setting for new joiners is unchanged"
+
+
+@pytest.mark.parametrize("before,after", [("viewer", "editor"), ("editor", "owner"), ("editor", "editor")])
+def test_raising_or_keeping_access_leaves_the_link(ctx, before, after):
+    owner, ana = User(ctx, "owner"), User(ctx, "ana")
+    lib = make_library(owner)
+    join(owner, lib, ana, before)
+    link = new_link(owner, lib)
+    assert change_role(owner, lib, ana, after).status_code == 200
+    assert owner.call("GET", f"/api/libraries/{lib}/join-link").json() == link
+
+
+def test_stepping_down_yourself_keeps_the_link(ctx):
+    owner, ana = User(ctx, "owner"), User(ctx, "ana")
+    lib = make_library(owner)
+    join(owner, lib, ana, "owner")
+    link = new_link(owner, lib)
+    assert change_role(ana, lib, ana, "editor").status_code == 200
+    assert owner.call("GET", f"/api/libraries/{lib}/join-link").json() == link
+
+
 # ------------------------------------------------------------------------------ rate limits
 
 def test_wrong_codes_are_limited_but_a_real_link_still_works(ctx):

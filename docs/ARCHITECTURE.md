@@ -320,6 +320,8 @@ Build before tuning any threshold. Use the labeled sets already in the repo (`ap
 
 ## 8. Operations
 
+- **Database connections are pooled** (`app/db/session.py`): opening one per request cost about 0.6 s against the hosted
+  database. Identity is set per transaction only; `tests/test_connection_reuse.py` guards that.
 - **Local dev:** `docker compose up` brings up Postgres (pgvector + PostGIS image), a local S3-compatible store (MinIO) in place of R2, the API, and the worker. `make dev` wraps it.
 - **Migrations:** Alembic, one baseline plus incremental. RLS policies live in migrations.
 - **Tests:** `pytest`. Unit tests for date ladder, filename parsing, clustering assignment, age-window matching; integration tests against a throwaway Postgres with RLS **specifically asserting that user A in library 1 cannot read library 2** (the most important test in the repo); invite and role-rule tests (last owner cannot be removed, invite email must match).
@@ -453,7 +455,7 @@ Implemented as the **expand** half of an expand/contract migration: new structur
 **Owner steps for this phase**
 
 - [x] Add the CORS policy in `infra/r2-cors.json` to the R2 bucket (done and verified live by `scripts/check_storage.py`: preflight allows the origin and `PUT`, refuses a foreign origin).
-- [ ] Turn off public access on the bucket (Cloudflare: R2 > bucket > Settings > Public access / r2.dev subdomain / custom domain). `scripts/check_storage.py` currently reports `STILL PUBLIC`. Nothing in the app uses the public URL any more, so this is safe to do now.
+- [x] Turn off public access on the bucket (owner, 2026-11-25; `scripts/check_storage.py` reports "not public", HTTP 401, and signed upload and read checks pass).
 - [ ] When a real domain exists, add its origin to the CORS policy (never `*` for uploads).
 
 **Tasks (all done)**
@@ -502,10 +504,15 @@ Implemented as the **expand** half of an expand/contract migration: new structur
   limited per account and per address; link tokens are not limited. Token and code are stored readable (owners only,
   RLS) so they can be shown again. This replaces decision 6's email-bound invites for the app; the email invite
   endpoints remain. Tests: `tests/test_join_links.py` (the safety rules were mutation-checked).
-- [ ] The `/join` page that the link opens (comes with the sign-up and join screens).
+- [x] First app screens, `app/web/app.{html,css,js}` at `/app` and `/join`: sign up, sign in, password reset, home
+  (`GET /api/libraries/overview`), create, join, invite, plain photo grid, settings, rename, leave. Strict content
+  security policy; no inline code. Tests: `tests/test_app_page.py`; walked through in a real browser against a
+  throwaway database and a stand-in sign-in service (**not yet against real Supabase**).
+- [ ] Screens not built yet from that flow: selfie, names, recognition consent, help, member management.
 - [x] Removing a member expires the link and code (owner, 2026-11-25; database trigger, so any path does it). Leaving
   on your own does not.
-- [ ] **Open:** someone changed to viewer can leave and rejoin through an editor link, regaining editor.
+- [x] Reducing someone's access also expires the link (migration `0010`, applied to the live database 2026-11-25 after a backup and rehearsal),
+  so they cannot leave and rejoin with their old access.
 - [ ] Hosting (Phase 7): pass the real client address through any proxy, or all users share one address limit.
 - [ ] Still to do in 4c: sign-up and album screens, account selfie and consent, per-album recognition consent, names
   and claim a person, opt-out and data deletion, guardian handling, abuse limits.
@@ -558,6 +565,11 @@ codes and emails are case-insensitive. **Album filters:** people (together or an
 date; local dates via `taken_local`), added by; the count of matching photos is shown before applying.
 
 
+- [x] First slice (2026-11-25): filters on `GET /api/photos` (`person`, `match`, `year`, `date_from`, `date_to`,
+  `on_day`, `undated`, `uploader`), `GET /api/photos/count` and `/filters`, and the app's filter screen. Dates use the
+  local wall clock. Photos dated only from the file time (`file_mtime`) or `legacy` count as **No date** (owner,
+  2026-11-25); the stored value is kept, and they sort after dated photos. Typed search, name resolution and CLIP are
+  still to do.
 - [ ] Single `GET /search` per section 6.3 with keyset pagination and signed thumbnail URLs.
 - [ ] Age-window matching (6.2).
 - [ ] Name search through aliases, with disambiguation when a name matches several people.
@@ -572,6 +584,26 @@ date; local dates via `taken_local`), added by; the count of matching photos is 
 - [ ] Device import (iOS photo library) if native is chosen (open question 3).
 
 **Done when:** a non-technical family member can onboard, import, and find "Mia, 2019" without help.
+
+### Loading speed: prefetch now, caching later (discussed with the owner 2026-11-25; none of it is built)
+
+**With the photo viewer (Phase 6)**
+- Open the viewer on top of the grid, so closing it returns to the same place and filters without reloading.
+- After filtering, quietly fetch the full-view (`display`) copies of the photos on screen, **up to 12**. In the viewer
+  also fetch the previous and next photo. Reuse the same link while the viewer is open, stop when leaving the filter,
+  and skip when the browser reports data saver (iPhones do not). Keep 12 as one setting; to tune it, measure how often
+  prefetched photos are opened. The number is a proposal: about one phone screen, roughly 1.2 MB on the test album
+  and 3.5 MB for phone-quality photos (the latter estimated from only 6 photos).
+
+**Proper caching: later, after hosting, and only if measurements show pictures are still slow**
+- Today every response signs new picture links, so a revisit downloads pictures again. The storage sends `ETag` and
+  `Last-Modified` but no `Cache-Control`.
+- Option: reuse each signed link for a while and set `Cache-Control: private`. Saved copies only help while the link is
+  unchanged, so reuse time is the benefit, and longer links mean a removed member's existing links work longer
+  (reuse 5 min with 10 min links, or reuse 30 min with 1 hour links).
+- Never cache permission decisions. App files (about 50 KB) are not worth caching yet.
+- Measured 2026-11-25 from a laptop (test script, not a phone): listing 60 photos about 0.4 s; 12 thumbnails (180 KB)
+  about 0.3 s; 60 thumbnails (1 MB) about 1.2 s. Hosting near the database should matter more than picture caching.
 
 ### Phase 7: Production readiness
 

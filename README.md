@@ -53,7 +53,7 @@ refuse to run against a non-local host.
 
 ## Sign-in setup (Supabase Auth)
 
-Sign-in is by emailed magic link. The API verifies Supabase tokens using your project's public
+The app (`/app`) signs people in with email and password; the older `/login` page uses an emailed link. The API verifies Supabase tokens using your project's public
 signing keys, so no secret is needed. In `.env`:
 
 ```
@@ -63,7 +63,8 @@ APP_BASE_URL=http://localhost:8000
 ```
 
 In the Supabase dashboard: Authentication > Providers > Email enabled; Authentication > URL
-Configuration > Site URL `http://localhost:8000` and redirect `http://localhost:8000/**`.
+Configuration > Site URL `http://localhost:8000` and redirect `http://localhost:8000/**` (the app's confirmation
+and password-reset emails return to `/app`). Invite links start with `APP_BASE_URL`.
 
 Then run the API, open <http://localhost:8000/login>, and request a link. After the first sign-in,
 link your pre-existing profile (library, photos) to your account:
@@ -73,13 +74,13 @@ python scripts/link_owner.py --email you@example.com           # dry run
 python scripts/link_owner.py --email you@example.com --apply
 ```
 
-To invite someone, an owner calls `POST /api/libraries/{id}/invites` (try it in `/docs` after
-clicking Authorize with the token from `/login`) and sends them the returned link.
+To invite someone, an owner opens the album in the app and taps **Invite people** (a link, with a code as backup).
+The older email-bound invite, `POST /api/libraries/{id}/invites`, still works.
 
 ## Run it
 
 ```bash
-uvicorn app.main:app --reload     # the API (signs in via /login, uploads via /upload)
+uvicorn app.main:app --reload     # the site: open http://localhost:8000/app (uploads still use /upload)
 python -m app.worker              # the background worker: REQUIRED for uploads to finish processing
 ```
 
@@ -101,6 +102,9 @@ python scripts/backup_db.py --label pre-0009            # writes backups/ (gitig
 # local DB at the current version, then:
 python scripts/backup_db.py --restore-to $DATABASE_URL backups/<file>.json && alembic upgrade head
 ```
+
+**Test data:** the live "Face test" album has fake "Added by" accounts made by `scripts/fake_uploaders.py`
+(remove them with `--undo` before real use).
 
 Check the real bucket (signed uploads, CORS, public access) any time storage settings change:
 

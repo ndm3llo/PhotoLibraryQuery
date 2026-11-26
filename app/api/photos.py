@@ -1,7 +1,7 @@
 """Browse, view, correct and delete photos. All reads and writes go through Row Level Security."""
 import base64
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -19,12 +19,22 @@ from app.services.storage import get_storage
 router = APIRouter()
 
 EDIT_ROLES = ("owner", "editor")
+# A file's own timestamp says when it was saved or copied, not when the photo was taken, so such photos (and the
+# unreliable "legacy" dates) count as having no date. The stored value is kept.
+DATED = "(p.taken_at IS NOT NULL AND coalesce(p.taken_at_source, '') NOT IN ('file_mtime', 'legacy'))"
+# Wall-clock time where the photo was taken: the instant shifted by the camera's recorded UTC offset (no offset
+# recorded = the stored time already is the wall-clock time). NULL when undated.
+# Every date filter MUST compare this, never the UTC date.
+TAKEN_LOCAL = (f"(CASE WHEN {DATED} THEN "
+               "p.taken_at AT TIME ZONE CAST(coalesce(p.taken_tz, '+00:00') AS interval) END)")
+# Newest first by capture date, then the undated photos, newest upload first (moved far into the past so one value
+# orders both). Photos still being processed have no date yet and stay near the top.
+SORT_AT = (f"(CASE WHEN {DATED} THEN p.taken_at WHEN p.status = 'ready' THEN p.created_at - interval '1000 years' "
+           "ELSE p.created_at END)")
 LIST_COLUMNS = ("p.id, p.library_id, p.status, p.error, p.original_filename, p.width, p.height, p.taken_at, "
                 "p.taken_tz, p.taken_at_source, p.taken_at_confidence, p.thumb_key, p.created_at, p.near_duplicate_of, "
-                "coalesce(p.taken_at, p.created_at) AS sort_at, "
-                # Wall-clock time where the photo was taken: the instant shifted by the camera's recorded UTC
-                # offset (no offset recorded = the stored time already is the wall-clock time).
-                "(p.taken_at AT TIME ZONE CAST(coalesce(p.taken_tz, '+00:00') AS interval)) AS taken_local")
+                f"{SORT_AT} AS sort_at, "
+                f"{TAKEN_LOCAL} AS taken_local")
 
 
 class DatePatch(BaseModel):
@@ -62,29 +72,137 @@ def _decode_cursor(cursor: str) -> tuple[datetime, uuid.UUID]:
         raise HTTPException(status_code=400, detail="Invalid cursor") from None
 
 
+class PhotoFilters:
+    """Which photos to show. Every filter given must hold (people AND dates AND who added them)."""
+
+    def __init__(
+        self,
+        person: list[uuid.UUID] = Query(default=[], max_length=20, description="Repeat for several people"),
+        match: Literal["all", "any"] = Query("all", description="all = everyone is in the same photo"),
+        year: int | None = Query(None, ge=MIN_YEAR, le=9999),
+        date_from: date | None = None,
+        date_to: date | None = None,
+        on_day: str | None = Query(None, pattern=r"^(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])$",
+                                   description="MM-DD in any year"),
+        undated: bool = False,
+        uploader: list[uuid.UUID] = Query(default=[], max_length=50),
+    ):
+        self.person, self.match, self.year = sorted(set(person)), match, year
+        self.date_from, self.date_to, self.on_day, self.undated = date_from, date_to, on_day, undated
+        self.uploader = sorted(set(uploader))
+
+    def clauses(self) -> tuple[list[str], dict]:
+        where, params = [], {}
+        if self.person:
+            chosen = "f.photo_id = p.id AND f.person_id = ANY(CAST(:persons AS uuid[]))"
+            params["persons"] = [str(i) for i in self.person]
+            if self.match == "any":
+                where.append(f"EXISTS (SELECT 1 FROM face f WHERE {chosen})")
+            else:
+                where.append(f"(SELECT count(DISTINCT f.person_id) FROM face f WHERE {chosen}) = :person_count")
+                params["person_count"] = len(self.person)
+        if self.year is not None:
+            where.append(f"extract(year FROM {TAKEN_LOCAL}) = :year")
+            params["year"] = self.year
+        if self.date_from:
+            where.append(f"CAST({TAKEN_LOCAL} AS date) >= :date_from")
+            params["date_from"] = self.date_from
+        if self.date_to:
+            where.append(f"CAST({TAKEN_LOCAL} AS date) <= :date_to")
+            params["date_to"] = self.date_to
+        if self.on_day:
+            where.append(f"to_char({TAKEN_LOCAL}, 'MM-DD') = :on_day")
+            params["on_day"] = self.on_day
+        if self.undated:
+            where.append(f"NOT {DATED}")
+        if self.uploader:
+            where.append("p.uploader_id = ANY(CAST(:uploaders AS uuid[]))")
+            params["uploaders"] = [str(i) for i in self.uploader]
+        return where, params
+
+
+@router.get("/count")
+def count_photos(library_id: uuid.UUID, filters: PhotoFilters = Depends(),
+                 user: AuthUser = Depends(current_user), session: Session = Depends(get_rls_session)):
+    """How many ready photos match, shown before the filters are applied."""
+    require_role(session, user.id, library_id, ("owner", "editor", "viewer"))
+    where, params = filters.clauses()
+    where += ["p.library_id = :lib", "p.status = 'ready'"]
+    total = session.execute(text(f"SELECT count(*) FROM photo p WHERE {' AND '.join(where)}"),
+                            {**params, "lib": library_id}).scalar()
+    return {"count": total}
+
+
+@router.get("/filters")
+def filter_choices(library_id: uuid.UUID, user: AuthUser = Depends(current_user),
+                   session: Session = Depends(get_rls_session)):
+    """What there is to filter by: named people (with a face to recognize them by), years, and who added photos."""
+    require_role(session, user.id, library_id, ("owner", "editor", "viewer"))
+    params = {"lib": library_id}
+    people = session.execute(text("""
+        WITH named AS (
+            SELECT f.person_id, f.bbox, f.person_source, p.id AS photo_id, p.thumb_key, p.width, p.height
+              FROM face f JOIN photo p ON p.id = f.photo_id AND p.status = 'ready'
+             WHERE f.library_id = :lib AND f.person_id IS NOT NULL),
+        counts AS (SELECT person_id, count(DISTINCT photo_id) AS photos FROM named GROUP BY person_id),
+        -- The face to show: one a person labelled, as large as possible within its photo.
+        best AS (
+            SELECT DISTINCT ON (person_id) person_id, bbox, thumb_key, width, height FROM named
+             ORDER BY person_id, (thumb_key IS NULL), (person_source IS NOT DISTINCT FROM 'auto'),
+                      CAST(bbox[3] - bbox[1] AS float) / greatest(width, 1) DESC NULLS LAST, photo_id)
+        SELECT x.id, x.display_name, x.qualifier, c.photos, b.bbox, b.thumb_key, b.width, b.height
+          FROM person x JOIN counts c ON c.person_id = x.id JOIN best b ON b.person_id = x.id
+         WHERE x.library_id = :lib AND NOT x.recognition_opt_out
+         ORDER BY c.photos DESC, lower(x.display_name), x.id"""), params).all()
+    years = session.execute(text(
+        f"SELECT CAST(extract(year FROM {TAKEN_LOCAL}) AS int) AS year, count(*) AS photos FROM photo p "
+        "WHERE p.library_id = :lib AND p.status = 'ready' GROUP BY 1 ORDER BY 1 DESC NULLS LAST"), params).all()
+    uploaders = session.execute(text(
+        "SELECT p.uploader_id AS id, pr.display_name, count(*) AS photos FROM photo p "
+        # Someone who has left is no longer visible to the others, but their photos remain.
+        "LEFT JOIN profile pr ON pr.id = p.uploader_id "
+        "WHERE p.library_id = :lib AND p.status = 'ready' GROUP BY 1, 2 ORDER BY 3 DESC, 2, 1"), params).all()
+    storage = get_storage()
+    return {
+        "people": [{"id": r.id, "display_name": r.display_name, "qualifier": r.qualifier, "photos": r.photos,
+                    "face": {"thumbnail_url": storage.presign_get(r.thumb_key) if r.thumb_key else None,
+                             "bbox": r.bbox, "width": r.width, "height": r.height}} for r in people],
+        "years": [{"year": r.year, "photos": r.photos} for r in years if r.year is not None],
+        "undated": sum(r.photos for r in years if r.year is None),
+        "uploaders": [{"id": r.id, "name": r.display_name or "Someone who left", "photos": r.photos,
+                       "is_me": r.id == user.id} for r in uploaders],
+    }
+
+
 @router.get("")
 def list_photos(
     library_id: uuid.UUID | None = None,
     status: Literal["pending", "processing", "ready", "failed", "duplicate"] | None = None,
     limit: int = Query(50, ge=1, le=200),
     cursor: str | None = None,
+    filters: PhotoFilters = Depends(),
     user: AuthUser = Depends(current_user),
     session: Session = Depends(get_rls_session),
 ):
-    """Newest first by capture time (upload time when the date is unknown). Pending uploads and
+    """Newest first by capture date, with undated photos after them. Pending uploads and
     duplicates are hidden unless asked for with ?status=."""
     if library_id:
         require_role(session, user.id, library_id, ("owner", "editor", "viewer"))
     where, params = [], {"lib": library_id, "limit": limit + 1}
     where.append("(CAST(:lib AS uuid) IS NULL OR p.library_id = CAST(:lib AS uuid))")
+    chosen, chosen_params = filters.clauses()
+    where += chosen
+    params.update(chosen_params)
     if status:
         where.append("p.status = :status")
         params["status"] = status
+    elif chosen:
+        where.append("p.status = 'ready'")  # matches the count shown before filtering
     else:
         where.append("p.status NOT IN ('pending', 'duplicate')")
     if cursor:
         params["cts"], params["cid"] = _decode_cursor(cursor)
-        where.append("(coalesce(p.taken_at, p.created_at), p.id) < (:cts, :cid)")
+        where.append(f"({SORT_AT}, p.id) < (:cts, :cid)")
 
     rows = session.execute(
         text(f"SELECT {LIST_COLUMNS} FROM photo p WHERE {' AND '.join(where)} "

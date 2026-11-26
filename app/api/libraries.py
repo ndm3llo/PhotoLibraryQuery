@@ -21,12 +21,14 @@ from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError
 from sqlmodel import Session
 
+from app.api.photos import DATED
 from app.auth.deps import current_user, get_rls_session, require_role
 from app.auth.jwt import AuthUser
 from app.auth.profiles import ensure_profile
 from app.config import INVITE_TTL_DAYS, app_base_url
 from app.db.audit import audit, valid_ip
 from app.services import join as joining
+from app.services.storage import get_storage
 
 router = APIRouter()
 invites_router = APIRouter()
@@ -37,6 +39,11 @@ _EMAIL = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 class LibraryCreate(BaseModel):
     name: str = Field(min_length=1, max_length=100)
+
+    @field_validator("name", mode="before")
+    @classmethod
+    def _trimmed(cls, v):
+        return v.strip() if isinstance(v, str) else v  # so a name of only spaces is refused
 
 
 class RoleChange(BaseModel):
@@ -113,6 +120,23 @@ def list_libraries(user: AuthUser = Depends(current_user), session: Session = De
     return [{"id": r.id, "name": r.name, "role": r.role} for r in rows]
 
 
+@router.get("/overview")
+def library_overview(user: AuthUser = Depends(current_user), session: Session = Depends(get_rls_session)):
+    """My albums for the home screen: role, how many photos, and the newest photo as a cover."""
+    rows = session.execute(
+        text("SELECT l.id, l.name, m.role, "
+             "(SELECT count(*) FROM photo p WHERE p.library_id = l.id AND p.status = 'ready') AS photo_count, "
+             "(SELECT p.thumb_key FROM photo p WHERE p.library_id = l.id AND p.status = 'ready' "
+             f" AND p.thumb_key IS NOT NULL ORDER BY {DATED} DESC, coalesce(p.taken_at, p.created_at) DESC, p.id "
+             "LIMIT 1) AS cover "
+             "FROM library l JOIN library_member m ON m.library_id = l.id AND m.profile_id = :u "
+             "ORDER BY l.name, l.id"),
+        {"u": user.id},
+    ).all()
+    return [{"id": r.id, "name": r.name, "role": r.role, "photo_count": r.photo_count,
+             "cover_url": get_storage().presign_get(r.cover) if r.cover else None} for r in rows]
+
+
 @router.patch("/{library_id}")
 def rename_library(library_id: UUID, body: LibraryCreate, user: AuthUser = Depends(current_user),
                    session: Session = Depends(get_rls_session)):
@@ -143,6 +167,7 @@ def list_members(library_id: UUID, user: AuthUser = Depends(current_user),
 def change_member_role(library_id: UUID, profile_id: UUID, body: RoleChange, request: Request,
                        user: AuthUser = Depends(current_user),
                        session: Session = Depends(get_rls_session)):
+    """Reducing someone else's access also stops the invite link and code (a database trigger)."""
     require_role(session, user.id, library_id, ("owner",))
     try:
         res = session.execute(
