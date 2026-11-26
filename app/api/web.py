@@ -5,6 +5,7 @@ meant to be embedded in client apps. NEVER expose the service-role key.
 """
 import os
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import HTMLResponse, Response
@@ -36,10 +37,13 @@ def _app_policy() -> str:
         auth = " " + supabase_url()
     except RuntimeError:
         auth = ""
+    # Saving a photo on a phone reads the file from storage, so the page may connect there too.
+    store = urlsplit((os.getenv("cloudflare_endpoint") or "").strip())
+    files = f" {store.scheme}://{store.netloc}" if store.scheme in ("http", "https") and store.netloc else ""
     return ("default-src 'none'; script-src 'self'; style-src 'self'; "
             # Photos come from signed storage links (https), or a local stand-in during development.
             "img-src 'self' data: https: http://localhost:* http://127.0.0.1:*; "
-            f"connect-src 'self'{auth}; base-uri 'none'; form-action 'self'; frame-ancestors 'none'")
+            f"connect-src 'self'{auth}{files}; base-uri 'none'; form-action 'self'; frame-ancestors 'none'")
 
 
 # "/join" is where an invite link lands; the token follows "#", so it never reaches the server.
@@ -53,6 +57,11 @@ def app_page():
 @router.get("/assets/app.js", include_in_schema=False)
 def app_script():
     return Response((_WEB / "app.js").read_text(encoding="utf-8"), media_type="text/javascript", headers=_HEADERS)
+
+
+@router.get("/assets/viewer.js", include_in_schema=False)
+def viewer_script():
+    return Response((_WEB / "viewer.js").read_text(encoding="utf-8"), media_type="text/javascript", headers=_HEADERS)
 
 
 @router.get("/assets/app.css", include_in_schema=False)

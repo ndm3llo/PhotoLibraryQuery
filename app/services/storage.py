@@ -9,7 +9,8 @@ Notes:
   `request_checksum_calculation="when_required"` turns that off, so the only header a browser must
   send is Content-Type (matching the CORS rule in infra/r2-cors.json).
 - Keys are library-scoped: {library_id}/originals/{photo_id}, {library_id}/display/{photo_id}.webp,
-  {library_id}/thumbs/{photo_id}.webp
+  {library_id}/thumbs/{photo_id}.webp, and {library_id}/download/{photo_id}/saved (the original without its hidden
+  details but with the date taken, made the first time someone asks)
 """
 import os
 from typing import Iterable
@@ -33,6 +34,16 @@ def display_key(library_id: UUID, photo_id: UUID) -> str:
 
 def thumb_key(library_id: UUID, photo_id: UUID) -> str:
     return f"{library_id}/thumbs/{photo_id}.webp"
+
+
+def download_key(library_id: UUID, photo_id: UUID) -> str:
+    return f"{library_id}/download/{photo_id}/saved"
+
+
+def download_keys(library_id: UUID, photo_id: UUID) -> list[str]:
+    """Every saved copy a photo may have, including the kinds made before the date was kept."""
+    return [download_key(library_id, photo_id), f"{library_id}/download/{photo_id}/clean",
+            f"{library_id}/download/{photo_id}.jpg"]
 
 
 class Storage:
@@ -80,11 +91,14 @@ class Storage:
             HttpMethod="PUT",
         )
 
-    def presign_get(self, key: str, expires: int = GET_URL_TTL_SECONDS, filename: str | None = None) -> str:
+    def presign_get(self, key: str, expires: int = GET_URL_TTL_SECONDS, filename: str | None = None,
+                    download: bool = False) -> str:
+        """`download` makes the browser save the file instead of showing it."""
         params = {"Bucket": self.bucket, "Key": key}
         if filename:
             safe = filename.replace('"', "").replace("\\", "")[:200]
-            params["ResponseContentDisposition"] = f'inline; filename="{safe}"'
+            how = "attachment" if download else "inline"
+            params["ResponseContentDisposition"] = f'{how}; filename="{safe}"'
         return self.client.generate_presigned_url("get_object", Params=params, ExpiresIn=expires)
 
     # -- server-side access --------------------------------------------------------------------

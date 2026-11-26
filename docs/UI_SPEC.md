@@ -129,15 +129,29 @@ person already typed.
 | Only owner leaving | "You're the only owner. Make someone else an owner first." |
 | Anything else | "Something went wrong. Please try again." |
 
-## Photo viewer: loading behaviour (planned, screen not designed)
+## Photo viewer (approved and built 2026-11-25)
 
-Tapping a photo opens it large on top of the grid, with previous, next, the date taken and Close. Closing returns to the
-same place with the same filters. Photos on screen after filtering (up to 12) and the neighbouring photos are prepared
-quietly so they open quickly. Details: [ARCHITECTURE.md](ARCHITECTURE.md), "Loading speed".
+- Tapping a photo shows **just the photo** on black, with a Close button and a **Details** button.
+- **Details** (button, or swipe up, as in Google and Apple Photos): date, people in the photo, who added it. Swipe
+  down or tap the handle to hide it. Swipe down on the plain photo closes it.
+- Swipe left or right for the previous or next photo, staying within the current filter.
+- Small copy first, then the sharp one; see [ARCHITECTURE.md](ARCHITECTURE.md), "Loading speed".
+- On a computer there are also arrow buttons and the arrow and Escape keys; touch screens show only the photo,
+  Close and Details. The phone's Back closes the photo.
+- **Saving** (owner, 2026-11-25): a button in Details, **Save photo** on phones (opens the share menu) and
+  **Download** on computers. Everyone in the album can save, "Only look" included. The saved copy is the **original
+  picture, in its own format and quality, with the date taken and no other metadata** (no location, camera or
+  captions); the album keeps the original untouched. The untouched file and the location are for owners and the
+  uploader.
+- **Two dates** (owner, 2026-11-25): Details shows **Date taken** and, separately, **Date added** (with who).
+  - Unknown date: "Not known", and **owners, editors and the uploader** get **Add date** (owner, 2026-11-26).
+  - Existing date (camera, file name or typed in): **only the uploader** gets **Change date**.
+  - "Only look" members change nothing, even for photos they added earlier. Dates back to 1850 are accepted.
+- Not included yet: delete.
 
 ## Not yet designed
 
-"See all" collections, picking photos after "Select", photo viewer, People tab and the full "Who is this?" naming
+"See all" collections, picking photos after "Select", People tab and the full "Who is this?" naming
 flow, upload, managing members, confirmation questions before removing or deleting anything, empty states, the first-time experience of an empty album, iPad and
 laptop layouts, and the guardian flow for children.
 

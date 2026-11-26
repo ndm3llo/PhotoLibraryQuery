@@ -309,7 +309,7 @@ def test_exact_duplicate_upload_is_hidden_but_traceable(ctx):
 
 def test_manual_date_correction_survives_reprocessing(ctx):
     owner, editor, *_ , lib = team(ctx)
-    ids, _, _ = upload(owner, lib, [spec("IMG_8457.JPG", make_image_bytes(date="2019:07:04 15:30:12", noise=9))])
+    ids, _, _ = upload(editor, lib, [spec("scan.jpg", make_image_bytes(noise=9))])  # no date of its own
     pump(ctx)
     pid = ids[0]
     r = editor.call("PATCH", f"/api/photos/{pid}", json={"taken_at": "2015-05-05T10:00:00Z"})
@@ -324,7 +324,7 @@ def test_manual_date_correction_survives_reprocessing(ctx):
     assert photo["taken_at"].startswith("2015-05-05") and photo["taken_at_source"] == "manual"
 
 
-@pytest.mark.parametrize("bad", ["1969-01-01T00:00:00Z", "1985-06-06T00:00:00Z", "2999-01-01T00:00:00Z", "not a date"])
+@pytest.mark.parametrize("bad", ["1849-12-31T00:00:00Z", "2999-01-01T00:00:00Z", "not a date"])
 def test_manual_date_must_be_plausible(ctx, bad):
     owner, *_, lib = team(ctx)
     ids, _, _ = upload(owner, lib, [spec("a.jpg")])
@@ -380,3 +380,53 @@ def test_listing_is_newest_first_paginated_and_filtered(ctx):
     assert owner.call("GET", "/api/photos", params={"cursor": "garbage"}).status_code == 400
     assert owner.call("GET", "/api/photos", params={"limit": 0}).status_code == 422
     assert owner.call("GET", "/api/photos", params={"status": "weird"}).status_code == 422
+
+
+def test_who_may_add_a_missing_date_and_who_may_change_one(ctx):
+    owner, editor, viewer, _, lib = team(ctx)
+    other = User(ctx, "other")
+    join(owner, lib, other, "editor")
+    ids, _, _ = upload(editor, lib, [spec("scan.jpg", make_image_bytes(noise=21)),
+                                     spec("cam.jpg", make_image_bytes(date="2019:07:04 15:30:12", noise=22)),
+                                     spec("scan2.jpg", make_image_bytes(noise=25))])
+    pump(ctx)
+    undated, camera, second = ids
+
+    def can(user, pid):
+        return user.call("GET", f"/api/photos/{pid}/details").json()["can_set_date"]
+
+    def put(user, pid, when="1962-08-09T12:00:00"):
+        return user.call("PATCH", f"/api/photos/{pid}", json={"taken_at": when}).status_code
+
+    # Missing: owners, editors and the uploader may add it; viewers may not.
+    assert [can(u, undated) for u in (editor, owner, other, viewer)] == [True, True, True, False]
+    assert put(viewer, undated) == 403
+    assert put(other, undated) == 200, "another editor adds a missing date"
+    assert put(owner, second) == 200, "so does the owner"
+    # Once there is a date, only the uploader may change it, wherever it came from.
+    for pid in (camera, undated):
+        assert [can(u, pid) for u in (editor, owner, other, viewer)] == [True, False, False, False]
+        assert put(owner, pid) == put(other, pid) == put(viewer, pid) == 403
+    assert put(editor, camera, "2018-01-02T12:00:00") == 200, "a wrong camera clock can be fixed"
+    after = editor.call("GET", f"/api/photos/{camera}").json()
+    assert after["taken_local"].startswith("2018-01-02") and after["taken_at_source"] == "manual"
+    assert put(editor, undated, "1963-01-02T12:00:00") == 200
+    listed = editor.call("GET", "/api/photos", params={"library_id": lib, "year": 1963}).json()["items"]
+    assert [p["id"] for p in listed] == [undated]
+
+
+def test_an_uploader_who_may_now_only_look_cannot_set_dates(ctx):
+    owner, editor, _, _, lib = team(ctx)
+    ids, _, _ = upload(editor, lib, [spec("scan.jpg", make_image_bytes(noise=23))])
+    pump(ctx)
+    assert owner.call("PATCH", f"/api/libraries/{lib}/members/{editor.id}", json={"role": "viewer"}).status_code == 200
+    assert editor.call("GET", f"/api/photos/{ids[0]}/details").json()["can_set_date"] is False
+    assert editor.call("PATCH", f"/api/photos/{ids[0]}", json={"taken_at": "2001-01-01T12:00:00"}).status_code == 403
+
+
+def test_details_say_when_the_photo_was_added(ctx):
+    owner, *_, lib = team(ctx)
+    ids, _, _ = upload(owner, lib, [spec("a.jpg", make_image_bytes(noise=24))])
+    pump(ctx)
+    added = owner.call("GET", f"/api/photos/{ids[0]}/details").json()["added_at"]
+    assert added[:2] == "20" and "T" in added

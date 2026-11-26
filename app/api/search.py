@@ -1,4 +1,3 @@
-import json
 import uuid
 
 from fastapi import APIRouter, Depends, Query
@@ -26,7 +25,6 @@ async def search_photos(
     rows = session.execute(
         text("""
             SELECT id, library_id, uploader_id, display_key, thumb_key, taken_at,
-                   ST_AsGeoJSON(location) AS location_json,
                    1 - (clip_embedding <=> :query_vec) AS similarity
             FROM photo
             WHERE status = 'ready' AND clip_embedding IS NOT NULL
@@ -48,7 +46,6 @@ async def search_photos(
                 "display_url": storage.presign_get(r.display_key) if r.display_key else None,
                 "thumbnail_url": storage.presign_get(r.thumb_key) if r.thumb_key else None,
                 "taken_at": r.taken_at.isoformat() if r.taken_at else None,
-                "location": json.loads(r.location_json) if r.location_json else None,
                 "similarity_score": round(float(r.similarity), 4),
             }
             for r in rows

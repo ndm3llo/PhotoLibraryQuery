@@ -203,7 +203,7 @@ Client never sends file bytes to the API.
 
 **Date resolution ladder (first hit wins; record the source)**
 
-1. `DateTimeOriginal` (tag 36867, in the Exif sub-IFD `0x8769`) + `OffsetTimeOriginal` (36880).
+1. `DateTimeOriginal` (tag 36867, in the Exif sub-IFD `0x8769`) + `OffsetTimeOriginal` (36881; falls back to `OffsetTime`, 36880).
 2. `DateTimeDigitized` (36868).
 3. QuickTime / HEIC creation date.
 4. Filename patterns: `IMG_YYYYMMDD…`, `YYYY-MM-DD…`, `IMG-YYYYMMDD-WA…`.
@@ -212,6 +212,20 @@ Client never sends file bytes to the API.
 7. Manual (UI: edit one photo, or "shift dates for this batch").
 
 Do **not** use tag 306 (`DateTime`) as a primary source. It is the file-modified time and is the value the prototype currently ends up with. Remove the debug `print` dumps from `extract_metadata.py`.
+
+**Manual dates** (owner, 2026-11-26): `PATCH /api/photos/{id}` needs owner or editor. Adding a missing date is open
+to all of them; changing an existing one (including a typed one) only to the uploader. Years 1850 to today. The
+database policy still lets any editor update photos directly through the Supabase Data API.
+
+**Saved copies** (owner, 2026-11-26: "originals but not with metadata"): `app/services/clean_copy.py` keeps the
+compressed picture byte for byte and removes or blanks everything describing it (orientation, color profile and the
+app's date taken stay),
+for JPEG, PNG, WebP and HEIC. The result is checked (nothing but orientation and that date, no XMP, no original values, identical pixels); otherwise the
+photo is rebuilt from its pixels as JPEG. Extra pictures after a JPEG (iPhone HDR layer, motion clips) are dropped.
+`POST /api/photos/{id}/save-copy` serves it to any member; `GET .../url?size=original` gives the untouched file only to
+owners and the uploader and the clean copy to others; `location` in the photo detail follows the same rule.
+**Open:** the Supabase Data API (not used by the app) still lets members read `photo.location` and editors update photo
+rows directly; the owner should disable it. Hosting needs the real origin in the storage CORS rule for `GET`.
 
 **Media delivery:** the bucket is private. `GET /photos/{id}/url?size=thumb|display|original` checks RLS (select on `photo`) and returns a signed R2 URL valid ~10 minutes. The prototype's use of `R2_PUBLIC_URL` means anyone with a link can view a photo; that must go.
 
@@ -585,15 +599,15 @@ date; local dates via `taken_local`), added by; the count of matching photos is 
 
 **Done when:** a non-technical family member can onboard, import, and find "Mia, 2019" without help.
 
-### Loading speed: prefetch now, caching later (discussed with the owner 2026-11-25; none of it is built)
+### Loading speed: prefetch now, caching later (discussed with the owner 2026-11-25; caching is not built)
 
-**With the photo viewer (Phase 6)**
+**Photo viewer: small copy first, built 2026-11-25** (`app/web/viewer.js`, `GET /api/photos/{id}/details`) (owner, 2026-11-25; replaces an earlier idea of prefetching up
+to 12 photos after filtering)
+- On tap, show the thumbnail the grid already downloaded, then swap in the `display` copy when it arrives.
+- Quietly fetch only the previous and next photo.
+- Send each photo's display link with the photo list, so a tap needs no extra request to the server.
 - Open the viewer on top of the grid, so closing it returns to the same place and filters without reloading.
-- After filtering, quietly fetch the full-view (`display`) copies of the photos on screen, **up to 12**. In the viewer
-  also fetch the previous and next photo. Reuse the same link while the viewer is open, stop when leaving the filter,
-  and skip when the browser reports data saver (iPhones do not). Keep 12 as one setting; to tune it, measure how often
-  prefetched photos are opened. The number is a proposal: about one phone screen, roughly 1.2 MB on the test album
-  and 3.5 MB for phone-quality photos (the latter estimated from only 6 photos).
+- Prefetch more only if sharpening proves slow on real phones.
 
 **Proper caching: later, after hosting, and only if measurements show pictures are still slow**
 - Today every response signs new picture links, so a revisit downloads pictures again. The storage sends `ETag` and

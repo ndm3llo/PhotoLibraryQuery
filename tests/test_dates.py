@@ -145,3 +145,13 @@ def test_gps_round_trip_and_bounds():
     assert em.extract_gps_wkt(FakeExif(gps=null_island)) is None
     assert em.extract_gps_wkt(FakeExif()) is None
     assert em.extract_gps_wkt(None) is None
+
+
+def test_each_date_uses_its_own_time_zone_tag():
+    """Standard EXIF numbers: 36881 belongs to the original date, 36882 to the digitized one."""
+    original = FakeExif({36867: "2019:07:04 15:30:12", 36881: "+05:30", 36880: "-08:00"})
+    assert em.resolve_taken_at(original).tz == "+05:30"
+    digitized = FakeExif({36868: "2019:07:04 15:30:12", 36882: "+02:00", 36881: "-08:00"})
+    assert em.resolve_taken_at(digitized).tz == "+02:00"
+    only_general = FakeExif({36867: "2019:07:04 15:30:12", 36880: "-03:00"})
+    assert em.resolve_taken_at(only_general).tz == "-03:00"

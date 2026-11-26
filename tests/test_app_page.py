@@ -9,12 +9,14 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 APP_JS = Path(__file__).resolve().parent.parent / "app" / "web" / "app.js"
+VIEWER_JS = APP_JS.with_name("viewer.js")
 TOKEN = "Ab3_-" * 9
 
 
 @pytest.fixture
 def client(app_db, monkeypatch):
     monkeypatch.setenv("SUPABASE_URL", "https://test.supabase.co")
+    monkeypatch.setenv("cloudflare_endpoint", "https://files.example.r2.dev/some/path")
     from app.api import web
     app = FastAPI()
     app.include_router(web.router)
@@ -27,20 +29,22 @@ def test_app_and_invite_pages_only_run_our_own_script(client, path):
     assert r.status_code == 200 and "/assets/app.js" in r.text
     policy = r.headers["content-security-policy"]
     assert "script-src 'self';" in policy and "unsafe" not in policy and "default-src 'none'" in policy
-    assert "connect-src 'self' https://test.supabase.co;" in policy
+    assert "connect-src 'self' https://test.supabase.co https://files.example.r2.dev;" in policy
     assert r.headers["referrer-policy"] == "no-referrer" and r.headers["x-frame-options"] == "DENY"
     assert "<script>" not in r.text and " style=" not in r.text, "inline code would be blocked"
 
 
 def test_assets_are_served(client):
     js, css = client.get("/assets/app.js"), client.get("/assets/app.css")
-    assert js.status_code == css.status_code == 200
+    viewer = client.get("/assets/viewer.js")
+    assert js.status_code == css.status_code == viewer.status_code == 200
+    assert viewer.headers["content-type"].startswith("text/javascript")
     assert js.headers["content-type"].startswith("text/javascript")
     assert css.headers["content-type"].startswith("text/css")
 
 
 def test_the_app_never_builds_pages_from_html_text():
-    source = APP_JS.read_text()
+    source = APP_JS.read_text() + VIEWER_JS.read_text()
     for risky in ("innerHTML", "outerHTML", "insertAdjacentHTML", "document.write", "eval("):
         assert risky not in source, risky
 
@@ -131,3 +135,40 @@ def test_face_square_stays_inside_the_photo():
     assert run("app.faceBox([900, 700, 1000, 800], 1000, 800)") == {"x": 830, "y": 630, "side": 170}
     assert run("app.faceBox([0, 0, 900, 900], 1000, 800)")["side"] == 800
     assert run("[app.faceBox(null, 10, 10), app.faceBox([1, 2, 3, 4], null, 10)]") == [None, None]
+
+
+def viewer(expression: str):
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("Node is not installed")
+    script = f"const v = require({json.dumps(str(VIEWER_JS))}); console.log(JSON.stringify({expression}))"
+    return json.loads(subprocess.run([node, "-e", script], capture_output=True, text=True, check=True).stdout)
+
+
+@pytest.mark.parametrize("move,open_,means", [
+    ((-80, 5), False, "next"), ((80, -5), False, "previous"), ((3, -90), False, "details"), ((3, 90), False, "close"),
+    ((3, 90), True, "hide"), ((3, -90), True, None), ((-80, 5), True, "next"), ((30, -30), False, None),
+])
+def test_what_each_swipe_does(move, open_, means):
+    assert viewer(f"v.swipeAction({move[0]}, {move[1]}, {json.dumps(open_)})") == means
+
+
+def test_the_date_is_shown_as_written_where_it_was_taken():
+    lines = viewer("v.dateLines('2019-12-31T21:30:00', 'exif_original')")
+    assert lines[0] == "December 31, 2019" and lines[1].startswith("Tuesday, 9:30") and lines[1].endswith("PM")
+    assert viewer("v.dateLines('2019-07-04T00:00:00', 'filename')") == ["July 4, 2019", "Thursday"], "no made-up time"
+    assert viewer("v.dateLines(null, 'file_mtime')") == ["Not known", ""]
+    assert viewer("[v.addedDate('2026-11-20T15:00:00+00:00'), v.addedDate(null) && 1, v.addedDate('junk')]") \
+        [0] == "November 20, 2026"
+
+
+def test_phones_share_and_computers_download():
+    assert viewer("[v.savesByShare(true, true), v.savesByShare(false, true), v.savesByShare(true, false)]") == \
+        [True, False, False]
+
+
+def test_photos_move_to_their_month_after_a_date_is_typed_in():
+    items = [{"id": 1, "taken_local": "2020-05-01T10:00:00"}, {"id": 2, "taken_local": "2024-01-01T12:00:00"},
+             {"id": 3, "taken_local": None}]
+    assert [(g["label"], [p["id"] for p in g["items"]]) for g in run(f"app.byMonth({json.dumps(items)})")] == \
+        [("January 2024", [2]), ("May 2020", [1]), ("No date", [3])]

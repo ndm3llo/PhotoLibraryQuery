@@ -219,3 +219,50 @@ def test_undated_photos_come_after_dated_ones_across_pages(ctx):
             break
     assert seen[:2] == [a.leo_only, a.both], "dated, newest first"
     assert sorted(seen[2:]) == sorted([a.mia_only, a.nobody]) and len(seen) == 4, "then undated, each once"
+
+
+# ----------------------------------------------------------------------------- the viewer
+
+def details(user, photo):
+    return user.call("GET", f"/api/photos/{photo}/details")
+
+
+def test_the_list_carries_a_signed_link_to_the_sharp_copy(ctx):
+    a = Album(ctx)
+    a.sql("UPDATE photo SET display_key = :k WHERE id = :p", k=f"{a.id}/display/{a.both}.webp", p=a.both)
+    items = {p["id"]: p for p in a.viewer.call("GET", "/api/photos", params={"library_id": a.id}).json()["items"]}
+    url = items[a.both]["display_url"]
+    assert f"{a.id}/display/{a.both}.webp" in url and "Signature" in url
+    assert items[a.mia_only]["display_url"] is None, "no sharp copy, no link"
+
+
+def test_details_name_each_person_once_from_left_to_right(ctx):
+    a = Album(ctx)
+    a.sql("UPDATE face SET bbox = ARRAY[500, 10, 600, 110] WHERE photo_id = :p AND person_id = :x",
+          p=a.both, x=a.mia)
+    body = details(a.viewer, a.both).json()
+    assert [(p["display_name"], p["qualifier"], p["bbox"][0]) for p in body["people"]] == \
+        [("Leo", "cousin", 10), ("Mia", None, 500)]
+    assert (body["width"], body["height"]) == (1000, 800)
+    twice = details(a.owner, a.mia_only).json()["people"]
+    assert [(p["display_name"], p["bbox"]) for p in twice] == [("Mia", [10, 10, 310, 310])], "her larger face"
+    assert details(a.owner, a.nobody).json()["people"] == [], "unnamed faces are left out"
+
+
+def test_details_say_who_added_the_photo(ctx):
+    a = Album(ctx)
+    assert details(a.helper, a.mia_only).json()["added_by"]["is_me"] is True
+    other = details(a.owner, a.mia_only).json()["added_by"]
+    assert other["is_me"] is False and other["name"].startswith("helper")
+    assert a.helper.call("DELETE", f"/api/libraries/{a.id}/members/{a.helper.id}").status_code == 204
+    assert details(a.owner, a.mia_only).json()["added_by"] == {"name": "Someone who left", "is_me": False}
+
+
+def test_details_hide_opted_out_people_and_outsiders_get_nothing(ctx):
+    a = Album(ctx)
+    a.sql("UPDATE person SET recognition_opt_out = true WHERE id = :p", p=a.mia)
+    assert [p["display_name"] for p in details(a.owner, a.both).json()["people"]] == ["Leo"]
+    outsider = User(ctx, "outsider")
+    make_library(outsider)
+    assert details(outsider, a.both).status_code == 404
+    assert ctx.client.get(f"/api/photos/{a.both}/details").status_code == 401

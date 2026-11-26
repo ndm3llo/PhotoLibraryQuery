@@ -65,11 +65,16 @@
   }
 
   // Group photos by the month they were taken, using the local wall-clock date (never converted to UTC).
+  // Newest first, then the undated ones. (Sorted here too, because a date can be typed in after loading.)
   function byMonth(items) {
     var names = ["January", "February", "March", "April", "May", "June", "July", "August", "September",
                  "October", "November", "December"];
     var groups = [], seen = {}, undated = [];
-    items.forEach(function (item) {
+    var newestFirst = items.slice().sort(function (a, b) {
+      var x = a.taken_local || "", y = b.taken_local || "";
+      return x === y ? 0 : x < y ? 1 : -1;
+    });
+    newestFirst.forEach(function (item) {
       var m = /^(\d{4})-(\d{2})/.exec(item.taken_local || "");
       if (!m) { undated.push(item); return; }
       var label = names[Number(m[2]) - 1] + " " + m[1];
@@ -163,7 +168,9 @@
            "M12 2.5v3M12 18.5v3M2.5 12h3M18.5 12h3M5.3 5.3l2.1 2.1M16.6 16.6l2.1 2.1M18.7 5.3l-2.1 2.1M7.4 16.6l-2.1 2.1"],
     photo: ["M6.5 4.5h11a3 3 0 013 3v9a3 3 0 01-3 3h-11a3 3 0 01-3-3v-9a3 3 0 013-3z", "M4 17l5-4.5 3.5 3 3-2.5 4.5 4"],
     next: ["M9 5l7 7-7 7"],
-    filter: ["M4 7h16M7 12h10M10 17h4"]
+    filter: ["M4 7h16M7 12h10M10 17h4"],
+    cross: ["M6 6l12 12M18 6L6 18"],
+    up: ["M6 15l6-6 6 6"]
   };
 
   function icon(name, size) {
@@ -481,18 +488,48 @@
     var error = el("p", { class: "error", role: "alert" });
     var more = button("Show more photos", { hidden: true });
 
-    async function load() {
+    var ordered = [], loading = null;  // the photos in the order the grid shows them
+
+    function load() {  // one batch at a time, whoever asks: the button or the viewer
+      if (!loading) loading = fetchBatch().finally(function () { loading = null; });
+      return loading;
+    }
+
+    function openPhoto(photoId) {
+      window.MemoriaViewer.open({
+        el: el, icon: icon, api: api, facePicture: facePicture, startId: photoId,
+        photos: function () { return ordered; },
+        more: function () { return cursor ? load() : null; },
+        closed: function (lastId, redated) {
+          if (redated) render();  // move re-dated photos to their month
+          // Put the keyboard back on the photo last looked at, without scrolling away.
+          var tile = photos.querySelector('[data-id="' + lastId + '"]');
+          if (tile) tile.focus({ preventScroll: true });
+        }
+      });
+    }
+
+    async function fetchBatch() {
       var page = await api("GET", "/api/photos?limit=60&library_id=" + encodeURIComponent(id) +
                                   (chosen ? "&" + chosen : "") +
                                   (cursor ? "&cursor=" + encodeURIComponent(cursor) : ""));
-      items = items.concat(page.items);
+      // A photo whose date was just typed in may come round again in a later batch: keep one of each.
+      var have = new Set(items.map(function (p) { return p.id; }));
+      items = items.concat(page.items.filter(function (p) { return !have.has(p.id); }));
       cursor = page.next_cursor;
+      render();
+    }
+
+    function render() {
       var shown = items.filter(function (p) { return p.thumbnail_url; });
       var waiting = items.filter(function (p) { return p.status === "processing"; }).length;
       if (!chosen) note.textContent = waiting ? photoCount(waiting) + " still being prepared." : "";
-      photos.replaceChildren.apply(photos, byMonth(shown).map(function (g) {
+      var groups = byMonth(shown);
+      ordered = groups.reduce(function (all, g) { return all.concat(g.items); }, []);
+      photos.replaceChildren.apply(photos, groups.map(function (g) {
         return el("section", {}, el("h2", {}, g.label), el("div", { class: "grid" }, g.items.map(function (p) {
-          return el("div", { class: "tile" },
+          return el("button", { type: "button", class: "tile", "data-id": p.id,
+                                onclick: function () { openPhoto(p.id); } },
                     el("img", { src: p.thumbnail_url, alt: p.filename || "Photo", loading: "lazy" }));
         })));
       }));
@@ -820,6 +857,7 @@
   async function draw() {
     var mine = ++drawing, first = firstDraw;
     firstDraw = false;
+    window.MemoriaViewer.dismiss();
     var parts = location.hash.replace(/^#\/?/, "").split("/");
     var name = parts[0], id = parts[1];
     root.classList.add("busy");

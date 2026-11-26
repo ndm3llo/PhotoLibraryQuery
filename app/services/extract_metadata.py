@@ -28,8 +28,11 @@ EXIF_IFD = 0x8769
 GPS_IFD = 0x8825
 TAG_DATETIME_ORIGINAL = 36867
 TAG_DATETIME_DIGITIZED = 36868
-TAG_OFFSET_ORIGINAL = 36880
-TAG_OFFSET_DIGITIZED = 36881
+TAG_OFFSET_ORIGINAL = 36881
+TAG_OFFSET_DIGITIZED = 36882
+# "OffsetTime", which belongs to the file's modification date. Used only when the date's own offset is missing
+# (earlier versions read it for the original date, and some cameras write only this one).
+TAG_OFFSET_GENERAL = 36880
 
 MIN_YEAR = 1990  # earlier than any digital photo a family will import; catches 1970/1904 epoch junk
 
@@ -122,7 +125,7 @@ def resolve_taken_at(exif, filename: str | None = None, client_last_modified: da
             (TAG_DATETIME_ORIGINAL, TAG_OFFSET_ORIGINAL, "exif_original", 0.95),
             (TAG_DATETIME_DIGITIZED, TAG_OFFSET_DIGITIZED, "exif_digitized", 0.85),
         ):
-            parsed = _parse_exif_datetime(sub.get(tag), sub.get(offset_tag))
+            parsed = _parse_exif_datetime(sub.get(tag), sub.get(offset_tag) or sub.get(TAG_OFFSET_GENERAL))
             if parsed and _plausible(parsed[0], now):
                 return TakenAt(parsed[0], source, confidence if parsed[1] else confidence - 0.05, parsed[1])
 
