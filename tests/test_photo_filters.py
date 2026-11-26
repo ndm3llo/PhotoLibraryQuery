@@ -234,6 +234,7 @@ def test_the_list_carries_a_signed_link_to_the_sharp_copy(ctx):
     url = items[a.both]["display_url"]
     assert f"{a.id}/display/{a.both}.webp" in url and "Signature" in url
     assert items[a.mia_only]["display_url"] is None, "no sharp copy, no link"
+    assert items[a.both]["added_at"].startswith("20"), "shown at once when there is no date taken"
 
 
 def test_details_name_each_person_once_from_left_to_right(ctx):

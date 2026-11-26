@@ -218,7 +218,6 @@ main.busy > * { opacity: 0.5; transition: opacity 0.1s 0.15s; }
 .save { margin-top: 12px; }
 .save .status, .save .error { margin: 8px 0 0; text-align: center; }
 .save .status:empty { margin: 0; }
-.save > p:last-child { margin-top: 4px; text-align: center; }
 
 .set-date .link { min-height: 44px; font-size: 17px; font-weight: 600; white-space: nowrap; }
 .set-date form { margin-top: 10px; }

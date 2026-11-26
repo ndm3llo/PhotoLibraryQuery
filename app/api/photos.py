@@ -68,6 +68,7 @@ def _item(r, storage) -> dict:
         "taken_tz": r.taken_tz,
         "taken_at_source": r.taken_at_source,
         "taken_at_confidence": r.taken_at_confidence,
+        "added_at": r.created_at,
         "near_duplicate_of": r.near_duplicate_of,
         "thumbnail_url": storage.presign_get(r.thumb_key) if r.thumb_key else None,
         # Sent with the list so that opening a photo needs no extra request (signing happens locally and is cheap).

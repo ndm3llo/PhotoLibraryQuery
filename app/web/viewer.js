@@ -164,7 +164,7 @@
       if (target) show(target.id);
     }
 
-    // The button under the date. The copy it saves has no location (the server makes it that way).
+    // The button under the date. The server makes the copy it saves: the date taken stays, other metadata does not.
     function saveControl(photoId) {
       var label = byShare ? "Save photo" : "Download";
       var go = el("button", { type: "button", class: "btn primary" }, label);
@@ -224,14 +224,13 @@
           go.disabled = false;
         }
       });
-      return el("div", { class: "save" }, go, status,
-                el("p", { class: "muted small" }, "Saved copies keep the date, and leave out location and camera details."));
+      return el("div", { class: "save" }, go, status);
     }
 
     // "Add date" (or "Change date") under the date taken, for the person who added the photo.
     function dateControl(photo) {
       var known = !!photo.taken_local, holder = el("div", { class: "set-date" });
-      var start = el("button", { type: "button", class: "link", onclick: edit }, known ? "Change date" : "Add date");
+      var start = el("button", { type: "button", class: "link", onclick: edit }, known ? "Change date" : "Add date taken");
       function stop() { body.classList.remove("editing"); holder.replaceChildren(start); }
       function edit() {
         var now = new Date();
@@ -278,12 +277,14 @@
 
     async function fillDetails() {
       var id = shownId, photo = find(id).photo, date = dateLines(photo.taken_local, photo.taken_at_source);
+      var known = !!photo.taken_local;  // without a date taken, the day it was added stands at the top instead
       var rest = el("div", {}, el("p", { class: "muted" }, "Loading…"));
       var dating = el("div", {});
       body.classList.remove("editing");
-      body.replaceChildren(el("div", { class: "muted small" }, "Date taken"),
+      body.replaceChildren(el("div", { class: "muted small" }, known ? "Date taken" : "Date added"),
         el("div", { class: "when" },
-           el("div", {}, el("h2", { class: "date" }, date[0]), date[1] ? el("p", { class: "muted" }, date[1]) : null),
+           el("div", {}, el("h2", { class: "date" }, known ? date[0] : addedDate(photo.added_at)),
+              known ? el("p", { class: "muted" }, date[1]) : null),
            dating),
         saveControl(id), rest);
       body.scrollTop = 0;
@@ -304,9 +305,13 @@
                                                     height: d.height }),
                     el("span", {}, p.display_name + (p.qualifier ? ", " + p.qualifier : "")));
         })) : el("p", { class: "muted" }, "Nobody has been named in this photo."),
-        el("div", { class: "added" }, el("div", { class: "muted small" }, "Date added"),
-           el("strong", {}, addedDate(d.added_at)),
-           el("div", { class: "who" }, "by " + (d.added_by.is_me ? "you" : d.added_by.name))));
+        known ?
+          el("div", { class: "added" }, el("div", { class: "muted small" }, "Date added"),
+             el("strong", {}, addedDate(d.added_at)),
+             el("div", { class: "who" }, "by " + (d.added_by.is_me ? "you" : d.added_by.name))) :
+          // The date added is already at the top: only say who.
+          el("div", { class: "added" }, el("div", { class: "muted small" }, "Added by"),
+             el("strong", {}, d.added_by.is_me ? "You" : d.added_by.name)));
       sheet.classList.toggle("scrolls", body.scrollHeight > body.clientHeight);
     }
 

@@ -144,7 +144,8 @@ person already typed.
   captions); the album keeps the original untouched. The untouched file and the location are for owners and the
   uploader.
 - **Two dates** (owner, 2026-11-25): Details shows **Date taken** and, separately, **Date added** (with who).
-  - Unknown date: "Not known", and **owners, editors and the uploader** get **Add date** (owner, 2026-11-26).
+  - No date taken: the top shows **Date added** instead (never "Date taken: not known"), with who added it lower down.
+    **Owners, editors and the uploader** get **Add date taken** (owner, 2026-11-26).
   - Existing date (camera, file name or typed in): **only the uploader** gets **Change date**.
   - "Only look" members change nothing, even for photos they added earlier. Dates back to 1850 are accepted.
 - Not included yet: delete.
